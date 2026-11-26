@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, Any, cast
 from . import force_signal
 from .force_signal import BandResult, TripKind, is_short_bead, oh_shit_from_jam_peak
 from .pause import MonitorActions, MonitorTemplate
+from .first_layer import FirstLayerZControl
 
 if TYPE_CHECKING:
     from klippy.configfile import ConfigWrapper
@@ -225,6 +226,15 @@ class FilamentForce:
             },
         )
 
+        # Optional and bounded: statistical HIGH does not prove nozzle too close.
+        self.first_layer = FirstLayerZControl(
+            enabled=config.getboolean("first_layer_z_enabled", False),
+            step_mm=config.getfloat("first_layer_z_step", 0.02, above=0.0, maxval=0.05),
+            max_adjustments=config.getint("first_layer_z_max_adjustments", 3, minval=1, maxval=10),
+            cooldown_s=config.getfloat("first_layer_z_cooldown_s", 10.0, minval=0.0),
+            max_height_mm=config.getfloat("first_layer_z_max_height", 0.60, above=0.0),
+            max_force_g=config.getfloat("first_layer_z_max_force", 2000.0, above=0.0),
+        )
         self.sensor_name: str = config.get("sensor", "load_cell_probe")
         self.extruder_name: str = config.get("extruder", "extruder")
         self.continuous_detection: bool = config.getboolean(
@@ -317,6 +327,13 @@ class FilamentForce:
         self._test_runout: bool = False
 
         self.printer.register_event_handler("klippy:ready", self._handle_ready)
+        self.printer.register_event_handler("print_stats:reset", self._handle_job_reset)
+        for event in (
+            "print_stats:complete_printing",
+            "print_stats:error_printing",
+            "print_stats:cancelled_printing",
+        ):
+            self.printer.register_event_handler(event, self._handle_job_reset)
         self.printer.register_event_handler(
             "idle_timeout:printing", self._handle_printing
         )
@@ -429,6 +446,77 @@ class FilamentForce:
 
     def _rebuild_books(self) -> None:
         self.books = {}
+
+    def _handle_job_reset(self, *args: object) -> None:
+        """Undo only offsets owned by this module when a job ends/resets."""
+        del args
+        applied = self.first_layer.applied_mm
+        self.first_layer.reset()
+        if applied:
+            # MOVE=0: alter following G-code coordinates without additional motion.
+            self.reactor.register_callback(
+                lambda _t, d=applied: self.gcode.run_script(
+                    f"SET_GCODE_OFFSET Z_ADJUST={-d:.6f}"
+                )
+            )
+
+    def _first_layer_z_position(self) -> tuple[float | None, bool]:
+        toolhead = self.printer.lookup_object("toolhead", None)
+        if toolhead is None:
+            return None, False
+        status = toolhead.get_status(self.reactor.monotonic())
+        if "z" not in str(status.get("homed_axes", "")):
+            return None, False
+        gcode_move = self.printer.lookup_object("gcode_move", None)
+        if gcode_move is None:
+            return None, False
+        pos = gcode_move.get_status(self.reactor.monotonic()).get("gcode_position")
+        if pos is None:
+            return None, False
+        return float(pos.z), True
+
+    def _maybe_first_layer_adjust(self, source: str, raw_g: float) -> bool:
+        now = self.reactor.monotonic()
+        if self.actions.pending_recheck or self.suppress or not self._armed:
+            return False
+        stats = self.printer.lookup_object("print_stats", None)
+        if stats is None:
+            return False
+        status = stats.get_status(now)
+        layer = (status.get("info") or {}).get("current_layer")
+        z_mm, z_homed = self._first_layer_z_position()
+        ctl = self.first_layer
+        if not ctl.may_adjust(
+            source=source,
+            printing=status.get("state") == "printing",
+            layer=layer, z_mm=z_mm, z_homed=z_homed,
+            force_g=raw_g, now=now,
+        ):
+            return False
+        if raw_g >= self.oh_shit_force:
+            return False
+        try:
+            self.gcode.run_script(
+                f"SET_GCODE_OFFSET Z_ADJUST={ctl.step_mm:.6f}"
+            )
+        except Exception:
+            logging.exception("filament_force first-layer Z offset failed")
+            return False
+        ctl.record_adjustment(now)
+        logging.info(
+            _ff_line("first_layer_z", {
+                "step_mm": ctl.step_mm, "total_mm": ctl.applied_mm,
+                "count": ctl.adjustments, "z_mm": z_mm,
+                "force_g": f"{raw_g:.1f}",
+            })
+        )
+        self.last_msg = (
+            f"filament_force: first-layer Z +{ctl.step_mm:.3f}mm "
+            f"({ctl.adjustments}/{ctl.max_adjustments}); "
+            "monitoring continues"
+        )
+        self.gcode.respond_info(self.last_msg)
+        return True
 
     def _handle_ready(self) -> None:
         try:
@@ -769,7 +857,9 @@ class FilamentForce:
         )
         detail = f"{raw_g:.0f}g"
         self.reactor.register_callback(
-            lambda et, k=trip_kind, d=detail: self._trip(k, d)
+            lambda et, k=trip_kind, d=detail, raw=raw_g: self._trip(
+                k, d, source="band", force_g=raw
+            )
         )
         return next_time
 
@@ -1035,11 +1125,19 @@ class FilamentForce:
             f"(peak {peak:.0f}g). SAVE_CONFIG to keep it."
         )
 
-    def _trip(self, kind: TripKind, detail: str) -> None:
+    def _trip(
+        self, kind: TripKind, detail: str,
+        *, source: str = "hard", force_g: float = 0.0,
+    ) -> None:
         if self._triggering or self.actions.pending_recheck:
             return
         printing = self.actions.is_printing()
         if not printing and not self._test_runout:
+            return
+        # Only statistical HIGH may adjust. Hard-force and runout always pause.
+        if kind is TripKind.JAM and self._maybe_first_layer_adjust(
+            source, force_g
+        ):
             return
         self._triggering = True
         self._spike.abort()
@@ -1095,6 +1193,10 @@ class FilamentForce:
             high_bound = band.high_bound
             last_z = hist.last_z_score
         return {
+            "first_layer_z_enabled": int(self.first_layer.enabled),
+            "first_layer_z_adjustments": self.first_layer.adjustments,
+            "first_layer_z_total_mm": self.first_layer.applied_mm,
+            "first_layer_z_max_adjustments": self.first_layer.max_adjustments,
             "enabled": 1 if self.enabled else 0,
             "armed": 1 if self._armed else 0,
             "suppress": 1 if self.suppress else 0,
