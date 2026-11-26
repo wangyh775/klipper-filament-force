@@ -1,9 +1,11 @@
 """Safety regression tests for the opt-in first-layer Z controller."""
+from typing import Any
+
 from filament_force.first_layer import FirstLayerZControl
 
 
-def eligible(controller: FirstLayerZControl, **overrides: object) -> bool:
-    args = {
+def eligible(controller: FirstLayerZControl, **overrides: Any) -> bool:
+    args: dict[str, Any] = {
         "source": "band",
         "printing": True,
         "layer": 1,
