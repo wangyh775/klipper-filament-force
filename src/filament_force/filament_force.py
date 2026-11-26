@@ -1141,10 +1141,14 @@ class FilamentForce:
         if not printing and not self._test_runout:
             return
         # Only statistical HIGH may adjust. Hard-force and runout always pause.
-        if kind is TripKind.JAM and self._maybe_first_layer_adjust(
-            source, force_g
-        ):
-            return
+        if kind is TripKind.JAM:
+            try:
+                if self._maybe_first_layer_adjust(source, force_g):
+                    return
+            except Exception:
+                # Fail closed: any unexpected layer/status failure must
+                # preserve the original jam pause behavior.
+                logging.exception("filament_force first-layer gate failed")
         self._triggering = True
         self._spike.abort()
         try:
