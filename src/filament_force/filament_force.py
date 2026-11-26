@@ -48,11 +48,17 @@ def _resolve_load_cell(sensor: object) -> LoadCell:
     Accepts a [load_cell] object directly, or a [load_cell_probe] wrapper
     that owns ``_load_cell`` (Kalico LoadCellPrinterProbe).
     """
-    if hasattr(sensor, "add_client"):
-        return cast(Any, sensor)
+    # Kalico's [load_cell_probe].add_client streams *tap events*, not
+    # continuous force samples. Resolve its inner calibrated load cell first.
     inner = getattr(sensor, "_load_cell", None)
+    if inner is None:
+        getter = getattr(sensor, "get_load_cell", None)
+        if getter is not None:
+            inner = getter()
     if inner is not None and hasattr(inner, "add_client"):
         return cast(Any, inner)
+    if hasattr(sensor, "add_client"):
+        return cast(Any, sensor)
     raise ValueError(
         "sensor does not provide load-cell force streaming"
         " (expected [load_cell] or [load_cell_probe])"
@@ -1404,6 +1410,9 @@ class FilamentForce:
         bins_block = "\n".join(bin_lines)
         gcmd.respond_info(
             "filament_force:\n"
+            f"  first_layer_z={'on' if self.first_layer.enabled else 'off'}"
+            f" adjustments={self.first_layer.adjustments}/{self.first_layer.max_adjustments}"
+            f" total={self.first_layer.applied_mm:.3f}mm\n"
             f"  enabled={'on' if self.enabled else 'off'}"
             f" armed={'yes' if self._armed else 'no'}"
             f" suppress={'yes' if self.suppress else 'no'}"
