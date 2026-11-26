@@ -101,6 +101,56 @@ If your `RESUME` wrapper does extra work:
 {% endif %}
 ```
 
+## Experimental first-layer Z correction (opt-in)
+
+The first-layer Z correction is **disabled by default**. Enable it only after
+reviewing the hardware and testing with supervised, low-risk prints. It is a
+bounded recovery attempt for a *learned-band HIGH force event*, **not**
+a reliable classifier of nozzle-too-close versus genuine filament clogging.
+Absolute `oh_shit_force` trips and filament runout continue to pause.
+
+Configuration under `[filament_force]`:
+
+```ini
+first_layer_z_enabled: True
+first_layer_z_step: 0.02
+first_layer_z_max_adjustments: 3
+first_layer_z_cooldown_s: 10.0
+first_layer_z_max_height: 0.60
+first_layer_z_max_force: 2000.0
+```
+
+**First-layer detection is fail-closed.** The slicer must explicitly report
+layer 1 using `SET_PRINT_STATS_INFO CURRENT_LAYER=1`; the printer must be
+actively printing, Z homed, and its reported G-code Z height between 0 and
+`first_layer_z_max_height`. Missing or ambiguous layer information means
+the original jam-pause behavior remains in effect. Do not use layer 0 as a
+synonym for the first layer. Check slicer start/layer-change G-code first.
+
+Upon a confirmed *statistical* HIGH trip (three bad extrusion windows by
+default), and only if its measured force is below
+`first_layer_z_max_force` and the independent `oh_shit_force`, the module
+sends `SET_GCODE_OFFSET Z_ADJUST=+step` without an immediate extra Z move.
+It counts the adjustment, enforces cooldown, and checks again through normal
+force windows. If safety gates fail or adjustments are exhausted, original
+jam pause behavior applies. The total correction is reversed when the
+print-completion, cancellation, error, or new-file reset event fires,
+using `SET_GCODE_OFFSET Z_ADJUST=-total` without moving the axes.
+
+Verify with `FILAMENT_FORCE_QUERY`:
+`first_layer_z=on adjustments=1/3 total=0.020mm`. Corresponding
+`printer.filament_force` fields are available through Moonraker:
+`first_layer_z_enabled`, `first_layer_z_adjustments`,
+`first_layer_z_total_mm`, `first_layer_z_max_adjustments`.
+
+**Limitations:** No vision or independent nozzle/contact classification;
+the filter is based on a force anomaly. A real jam during layer 1 may
+temporarily receive a Z increase before the ordinary jam safeguard fires.
+The existing hard-force interlock is never bypassed. G-code offsets are
+session-scoped and rely on successful terminal callbacks for automatic
+undo; if the firmware crashes mid-job, inspect/reset the offset before
+printing again. Validate the sign on your machine's motion configuration.
+
 ## Spike check
 
 Continuous scoring watches forward extrusion. The spike check is separate:
