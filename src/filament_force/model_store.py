@@ -43,7 +43,7 @@ def _samples(value: object, limit: int) -> list[float]:
 
 
 def snapshot(
-    books: Mapping[int, ToolForceBook], fingerprint: dict[str, object]
+    books: Mapping[int, ToolForceBook], fingerprint: Mapping[str, object]
 ) -> dict[str, object]:
     tools: dict[str, object] = {}
     for key, book in sorted(books.items()):
