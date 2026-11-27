@@ -45,7 +45,10 @@ def test_fingerprint_mismatch_rejects_model() -> None:
 
 def test_malformed_or_nonfinite_samples_rejected() -> None:
     payload = snapshot({-1: make_book()}, PROFILE)
-    tools = cast(dict[str, object], payload["tools"])\n    tool = cast(dict[str, object], tools["-1"])\n    bins = cast(list[list[float]], tool["bins"])\n    bins[0][0] = float("nan")
+    tools = cast(dict[str, object], payload["tools"])
+    tool = cast(dict[str, object], tools["-1"])
+    bins = cast(list[list[float]], tool["bins"])
+    bins[0][0] = float("nan")
     result = decode(
         payload, PROFILE, n_bins=5, history_n=8, min_learn_windows=3
     )
