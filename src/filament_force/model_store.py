@@ -77,6 +77,15 @@ def decode(
     tools = data.get("tools")
     if not isinstance(tools, dict) or len(tools) > MAX_TOOLS:
         return ModelLoadResult("invalid", {}, "invalid tool model collection")
+    # A changed number of speed bins is a profile incompatibility, not a
+    # malformed/corrupt file. Reject the complete snapshot without partial use.
+    for payload in tools.values():
+        if (
+            not isinstance(payload, dict)
+            or not isinstance(payload.get("bins"), list)
+            or len(payload["bins"]) != n_bins
+        ):
+            return ModelLoadResult("incompatible", {}, "speed-bin count changed")
     result: dict[int, ToolForceBook] = {}
     try:
         for name, payload in tools.items():
