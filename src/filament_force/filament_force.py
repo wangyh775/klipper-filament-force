@@ -1486,6 +1486,8 @@ class FilamentForce:
             rebuild = True
         if rebuild:
             self._rebuild_books()
+        # Any runtime parameter change is reflected in the persisted profile.
+        self._model_dirty = True
 
         edges_s = ",".join(f"{e:g}" for e in self.speed_bin_edges)
         state = "on" if self.enabled else "off"
