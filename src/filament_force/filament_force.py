@@ -522,7 +522,7 @@ class FilamentForce:
             logging.exception("filament_force model_store save failed")
 
     def _model_save_event(self, eventtime: float) -> float:
-        if self._model_dirty and not self._armed:
+        if self._model_dirty:
             self._save_model_store()
         return eventtime + self.model_save_interval
 
@@ -891,6 +891,32 @@ class FilamentForce:
             logging.warning(
                 "filament_force restored model rejected T%d bin %d; relearning",
                 self.active_tool, bin_i,
+            )
+            return next_time
+        runout_key = (self.active_tool if self.active_tool >= 0 else -1, -1)
+        if runout_key in self._restored_bins and book.runout.learned:
+            run_stats = book.runout.mean_stdev()
+            tolerance = max(
+                3.0 * run_stats.stdev,
+                self.min_delta_g,
+                0.15 * run_stats.mean,
+            )
+            if abs(raw_g - run_stats.mean) <= tolerance:
+                self._restored_bins[runout_key] += 1
+                if self._restored_bins[runout_key] < 3:
+                    return next_time
+                del self._restored_bins[runout_key]
+                logging.info(
+                    "filament_force restored runout model validated T%d",
+                    self.active_tool,
+                )
+                return next_time
+            book.runout.reset()
+            self._restored_bins.pop(runout_key, None)
+            self._model_dirty = True
+            logging.warning(
+                "filament_force restored runout model rejected T%d; relearning",
+                self.active_tool,
             )
             return next_time
         trip = book.observe(
