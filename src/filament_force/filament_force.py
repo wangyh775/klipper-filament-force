@@ -33,6 +33,7 @@ from . import force_signal
 from .force_signal import BandResult, TripKind, is_short_bead, oh_shit_from_jam_peak
 from .pause import MonitorActions, MonitorTemplate
 from .first_layer import FirstLayerZControl
+from .model_store import ModelStore
 
 if TYPE_CHECKING:
     from klippy.configfile import ConfigWrapper
@@ -282,6 +283,19 @@ class FilamentForce:
         self.idle_reset_s: float = config.getfloat("idle_reset_s", 0.3, above=0.0)
         self.min_learn_s: float = config.getfloat("min_learn_s", 1.5, minval=0.0)
         self.debug_log: bool = config.getboolean("debug_log", False)
+        self.model_persistence: bool = config.getboolean("model_persistence", True)
+        self.model_file: str = config.get(
+            "model_file", "~/printer_data/config/filament_force_model.json"
+        )
+        self.model_profile: str = config.get("model_profile", "default")
+        self.model_save_interval: float = config.getfloat(
+            "model_save_interval", 60.0, above=0.0
+        )
+        self.model_store = ModelStore(self.model_file)
+        self._model_timer: Any | None = None
+        self._model_dirty = False
+        self._restored_bins: dict[tuple[int, int], int] = {}
+        self._model_load_state = "disabled"
         try:
             self.speed_bin_edges: tuple[float, ...] = (
                 force_signal.normalise_speed_bin_edges(
@@ -332,8 +346,12 @@ class FilamentForce:
         self._cal = OhShitCal()
         self._test_runout: bool = False
 
+        if self.model_persistence:
+            self._load_model_store()
+
         self.printer.register_event_handler("klippy:ready", self._handle_ready)
         self.printer.register_event_handler("print_stats:reset", self._handle_job_reset)
+        self.printer.register_event_handler("klippy:shutdown", self._handle_model_shutdown)
         for event in (
             "print_stats:complete_printing",
             "print_stats:error_printing",
@@ -450,8 +468,71 @@ class FilamentForce:
             self.books[key] = book
         return book
 
+    def _model_fingerprint(self) -> dict[str, object]:
+        return {
+            "profile": self.model_profile,
+            "sensor": self.sensor_name,
+            "extruder": self.extruder_name,
+            "speed_bins": list(self.speed_bin_edges),
+            "history_n": self.history_n,
+            "min_learn_windows": self.min_learn_windows,
+            "detection_length": self.detection_length,
+            "min_e_speed": self.min_e_speed,
+            "rolling_window": self.rolling_window,
+            "min_delta_g": self.min_delta_g,
+            "high_sigma": self.high_sigma,
+            "drop_ratio": self.drop_ratio,
+            "runout_max_level_g": self.runout_max_level_g,
+        }
+
+    def _load_model_store(self) -> None:
+        result = self.model_store.load(
+            self._model_fingerprint(),
+            n_bins=force_signal.speed_bin_count(self.speed_bin_edges),
+            history_n=self.history_n,
+            min_learn_windows=self.min_learn_windows,
+        )
+        self._model_load_state = result.state
+        if result.state == "loaded":
+            self.books = result.books
+            for tool, book in self.books.items():
+                for index, hist in enumerate(book.bins):
+                    if hist.learned:
+                        self._restored_bins[(tool, index)] = 0
+                if book.runout.learned:
+                    self._restored_bins[(tool, -1)] = 0
+            logging.info(
+                "filament_force model_store loaded %d tool(s); bins require validation",
+                len(self.books),
+            )
+        elif result.state not in ("missing", "disabled"):
+            logging.warning(
+                "filament_force model_store %s: %s; learning fresh",
+                result.state, result.reason,
+            )
+
+    def _save_model_store(self) -> None:
+        if not self.model_persistence or not self._model_dirty:
+            return
+        try:
+            self.model_store.save(self.books, self._model_fingerprint())
+            self._model_dirty = False
+            self._ff_log("model_saved", {"tools": len(self.books)})
+        except OSError:
+            logging.exception("filament_force model_store save failed")
+
+    def _model_save_event(self, eventtime: float) -> float:
+        if self._model_dirty and not self._armed:
+            self._save_model_store()
+        return eventtime + self.model_save_interval
+
     def _rebuild_books(self) -> None:
         self.books = {}
+        self._restored_bins.clear()
+        self._model_dirty = True
+
+    def _handle_model_shutdown(self) -> None:
+        self._save_model_store()
 
     def _handle_job_reset(self, *args: object) -> None:
         """Undo only offsets owned by this module when a job ends/resets."""
@@ -535,6 +616,11 @@ class FilamentForce:
         mcu = self.printer.lookup_object("mcu", None)
         if mcu is not None:
             self._estimated_print_time = mcu.estimated_print_time
+        if self.model_persistence:
+            self._model_timer = self.reactor.register_timer(
+                self._model_save_event,
+                self.reactor.monotonic() + self.model_save_interval,
+            )
         self._poll_timer = self.reactor.register_timer(
             self._poll_event, self.reactor.NEVER
         )
@@ -780,6 +866,33 @@ class FilamentForce:
 
         book = self._book_for(self.active_tool)
         hist = book.bin_hist(bin_i)
+        restored_key = (self.active_tool if self.active_tool >= 0 else -1, bin_i)
+        if restored_key in self._restored_bins and hist.learned:
+            stats = hist.mean_stdev()
+            tolerance = max(3.0 * stats.stdev, self.min_delta_g, 0.15 * stats.mean)
+            if abs(raw_g - stats.mean) <= tolerance:
+                self._restored_bins[restored_key] += 1
+                if self._restored_bins[restored_key] < 3:
+                    self._ff_log("model_validate", {
+                        "tool": self.active_tool, "bin": bin_i,
+                        "streak": self._restored_bins[restored_key],
+                        "result": "within_band",
+                    })
+                    return next_time
+                del self._restored_bins[restored_key]
+                logging.info(
+                    "filament_force restored model validated T%d bin %d",
+                    self.active_tool, bin_i,
+                )
+                return next_time
+            hist.reset()
+            self._restored_bins.pop(restored_key, None)
+            self._model_dirty = True
+            logging.warning(
+                "filament_force restored model rejected T%d bin %d; relearning",
+                self.active_tool, bin_i,
+            )
+            return next_time
         trip = book.observe(
             raw_g,
             completed.e_speed,
@@ -844,6 +957,7 @@ class FilamentForce:
             },
         )
         trip_kind = TripKind.from_anomaly(trip) if trip is not None else None
+        self._model_dirty = True
         if trip_kind is None:
             return next_time
         # Trips are rare: always write klippy.log, even if debug_log is off.
@@ -1417,6 +1531,9 @@ class FilamentForce:
             f"  first_layer_z={'on' if self.first_layer.enabled else 'off'}"
             f" adjustments={self.first_layer.adjustments}/{self.first_layer.max_adjustments}"
             f" total={self.first_layer.applied_mm:.3f}mm\n"
+            f"  model_persistence={'on' if self.model_persistence else 'off'}"
+            f" model_state={self._model_load_state}"
+            f" pending_validation={len(self._restored_bins)}\n"
             f"  enabled={'on' if self.enabled else 'off'}"
             f" armed={'yes' if self._armed else 'no'}"
             f" suppress={'yes' if self.suppress else 'no'}"
@@ -1480,6 +1597,12 @@ class FilamentForce:
         tool = gcmd.get_int("TOOL", self.active_tool)
         book = self._book_for(tool)
         book.reset()
+        tool_key = tool if tool >= 0 else -1
+        self._restored_bins = {
+            key: value for key, value in self._restored_bins.items()
+            if key[0] != tool_key
+        }
+        self._model_dirty = True
         self._window.reset()
         self._spike.abort()
         self._spike.last_spike = 0
