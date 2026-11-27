@@ -1,11 +1,12 @@
 """Tests for versioned, validated force-model persistence."""
 import json
+from typing import cast
 
 from filament_force.force_signal import ToolForceBook
 from filament_force.model_store import ModelStore, decode, snapshot
 
 
-PROFILE = {"profile": "PEEK-400C-0.4", "speed_bins": [1.0, 2.0, 4.0, 7.0]}
+PROFILE: dict[str, object] = {"profile": "PEEK-400C-0.4", "speed_bins": [1.0, 2.0, 4.0, 7.0]}
 
 
 def make_book() -> ToolForceBook:
@@ -44,7 +45,7 @@ def test_fingerprint_mismatch_rejects_model() -> None:
 
 def test_malformed_or_nonfinite_samples_rejected() -> None:
     payload = snapshot({-1: make_book()}, PROFILE)
-    payload["tools"]["-1"]["bins"][0][0] = float("nan")  # type: ignore[index]
+    tools = cast(dict[str, object], payload["tools"])\n    tool = cast(dict[str, object], tools["-1"])\n    bins = cast(list[list[float]], tool["bins"])\n    bins[0][0] = float("nan")
     result = decode(
         payload, PROFILE, n_bins=5, history_n=8, min_learn_windows=3
     )
