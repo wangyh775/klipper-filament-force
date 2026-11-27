@@ -54,6 +54,44 @@ Detection is on. `FILAMENT_FORCE_SET ENABLE=0` turns it off.
 On a trip: fix the filament, then `RESUME`. If nothing was wrong:
 `FILAMENT_FORCE_RESET` then `RESUME`.
 
+## Persistent force model
+
+Healthy per-tool speed-bin windows and the runout history are persisted to a
+versioned JSON file. Persistence is enabled by default:
+
+```ini
+model_persistence: True
+model_file: ~/printer_data/config/filament_force_model.json
+model_profile: default
+model_save_interval: 60.0
+```
+
+The file is written atomically (temporary file + fsync + replace). Saves are
+periodic, including during long prints, and on Klipper shutdown. Only healthy
+statistical windows are stored; live force, tare/reference lock, pending trips,
+and anomaly streaks are never restored.
+
+After restart, each restored speed bin and the runout history is held out of
+scoring until three consecutive windows fall within a conservative validation
+band. A mismatch discards only that restored history and returns it to learning.
+A missing, malformed, incompatible, or unsupported-version file is not used;
+the plugin logs the reason and starts fresh. The independent absolute
+`oh_shit_force` interlock remains active regardless of model availability.
+
+**Model profiles are operator-managed.** Set a distinct `model_profile` for
+each materially different setup, for example
+`PEEK-400C-nozzle04-loadcellA`. Change it whenever material, nozzle diameter,
+hotend temperature range, load-cell mounting/calibration, or other
+force-affecting hardware/process conditions change. The plugin cannot infer
+filament chemistry from G-code automatically.
+
+Use `FILAMENT_FORCE_QUERY` to inspect `model_persistence`,
+`model_state`, and `pending_validation`. Use
+`FILAMENT_FORCE_SET MODEL_PERSISTENCE=0` to disable persistence for a
+session if needed. `FILAMENT_FORCE_RESET [TOOL=n]` clears that tool's learned
+history and the next save updates the store accordingly. Back up the JSON
+file before manual edits.
+
 ## Toolchanger
 
 Call two hooks from your park and pickup macros. The extra does not patch
