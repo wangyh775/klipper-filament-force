@@ -86,11 +86,10 @@ force-affecting hardware/process conditions change. The plugin cannot infer
 filament chemistry from G-code automatically.
 
 Use `FILAMENT_FORCE_QUERY` to inspect `model_persistence`,
-`model_state`, and `pending_validation`. Use
-`FILAMENT_FORCE_SET MODEL_PERSISTENCE=0` to disable persistence for a
-session if needed. `FILAMENT_FORCE_RESET [TOOL=n]` clears that tool's learned
-history and the next save updates the store accordingly. Back up the JSON
-file before manual edits.
+`model_state`, and `pending_validation`. Set `model_persistence: False` in
+the config and restart to disable persistence. `FILAMENT_FORCE_RESET
+[TOOL=n]` clears that tool's learned history and the next save updates the
+store accordingly. Back up the JSON file before manual edits.
 
 ## Toolchanger
 
