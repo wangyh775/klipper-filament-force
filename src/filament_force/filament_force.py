@@ -1690,8 +1690,8 @@ class FilamentForce:
                     f" FIRST_LAYER={int(self._diag_first_layer)} RESULT={d.result.value}"
                 )
             finally:
-                if self.actions.is_printing() and not self._jam_action_paused():
-                    self.gcode.run_script_from_command("PAUSE\nM400")
+                if self.actions.in_print_job() and not self._jam_action_paused():
+                    self._ensure_fault_pause("confirmed jam")
         elif d.result is Diagnosis.FLOW_COMPATIBLE:
             self._recovery.state = RecoveryState.WAITING_RECOVERY
             if recover and matched:
@@ -1829,7 +1829,7 @@ class FilamentForce:
         self.actions.set_pending(tool=tool, target=target, reason="jam")
         self.gcode.respond_info(f"filament_force: recovery stopped: {reason}")
         if self.actions.in_print_job() and not self._jam_action_paused():
-            self.gcode.run_script_from_command("PAUSE\nM400")
+            self._ensure_fault_pause(reason)
 
     def _watch_recovery(self, generation: int) -> None:
         while generation == self._diag_generation and self._recovery.state is RecoveryState.VERIFYING:
@@ -1955,19 +1955,31 @@ class FilamentForce:
             return bool(pause.get_status(self.reactor.monotonic()).get("is_paused"))
         return self.actions.print_stats_state() == "paused"
 
+    def _ensure_fault_pause(self, reason: str) -> bool:
+        """Fail closed when the configured PAUSE fails on an active job."""
+        try:
+            if not self._jam_action_paused():
+                self.gcode.run_script_from_command("PAUSE\nM400")
+            if self._jam_action_paused():
+                return True
+        except Exception:
+            logging.exception("filament_force fault pause failed")
+        if self.actions.in_print_job():
+            cast(Any, self.printer).invoke_shutdown(
+                "filament_force: fault pause not acknowledged: " + reason)
+        return False
+
     def _run_jam_action(self, tool: int, target: float, force_g: float) -> None:
         self.actions.set_pending(tool=tool, target=target, reason=TripKind.JAM.value)
         self._recovery.prepare()
         generation = self._diag_generation
         self.gcode.respond_info(f"{self.last_msg}. Preparing diagnosis.")
         try:
-            if not self._jam_action_paused():
-                self.gcode.run_script_from_command("PAUSE\nM400")
-            if generation != self._diag_generation:
-                return
-            if not self._jam_action_paused():
+            if not self._ensure_fault_pause("jam"):
                 self._recovery.fail("pause not acknowledged")
                 self._publish_event("recovery_failed", reason="pause not acknowledged")
+                return
+            if generation != self._diag_generation:
                 return
             self.actions.run_template_if_set(MonitorTemplate.JAM, {
                 "TOOL": tool, "REASON": "jam", "MSG": self.last_msg, "TARGET": target,
@@ -1981,7 +1993,7 @@ class FilamentForce:
             if generation != self._diag_generation:
                 return
             if not self._jam_action_paused():
-                self.gcode.run_script_from_command("PAUSE\nM400")
+                self._ensure_fault_pause("preparation did not remain paused")
                 self._recovery.fail("preparation did not remain paused")
                 return
             self._recovery.state = RecoveryState.WAITING_DIAGNOSIS
@@ -1991,8 +2003,8 @@ class FilamentForce:
             self._recovery.fail("preparation strategy failed")
             self._publish_event("recovery_failed", reason="preparation strategy failed")
             logging.exception("filament_force pre-diagnosis strategy failed")
-            if self.actions.is_printing() and not self._jam_action_paused():
-                self.gcode.run_script_from_command("PAUSE\nM400")
+            if self.actions.in_print_job() and not self._jam_action_paused():
+                self._ensure_fault_pause("preparation strategy failed")
 
     def _trip(
         self, kind: TripKind, detail: str,
@@ -2086,14 +2098,9 @@ class FilamentForce:
             if kind is TripKind.JAM:
                 self._run_jam_action(tool, target, force_g)
             else:
-                self.actions.soft_pause(
-                    f"{self.last_msg}. Pausing - fix filament, then RESUME.",
-                    tool=tool,
-                    target=target,
-                    reason=kind.value,
-                    from_command=True,
-                )
-                self.gcode.run_script_from_command("M400")
+                self.actions.set_pending(tool=tool, target=target, reason=kind.value)
+                self.gcode.respond_info(f"{self.last_msg}. Pausing - fix filament, then RESUME.")
+                self._ensure_fault_pause("runout")
 
     def _reset_stability(self) -> None:
         self._stable_since = self._stable_last = None

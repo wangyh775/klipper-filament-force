@@ -156,8 +156,7 @@ def test_runout_retains_independent_pause(
     configure_action(monitor, "gcode_macro FILAMENT_FORCE_JAM_ACTION")
     monitor._trip(TripKind.RUNOUT, "fault", source="band")
     assert gcode.run_script_from_command.call_args_list == [
-        call("PAUSE"),
-        call("M400"),
+        call("PAUSE\nM400"),
     ]
     assert monitor.actions.pending_recheck
 
@@ -169,3 +168,11 @@ def test_no_pause_ack_blocks_preparation(
     monitor._trip(TripKind.JAM, "fault", source="band")
     assert monitor._recovery.state is RecoveryState.FAILED
     assert gcode.run_script_from_command.call_args_list == [call("PAUSE\nM400")]
+    monitor.printer.invoke_shutdown.assert_called_once()
+
+
+def test_pause_exception_escalates_to_shutdown(monitor: FilamentForce, gcode: Mock) -> None:
+    gcode.run_script_from_command.side_effect = RuntimeError("pause failed")
+    monitor._trip(TripKind.JAM, "fault", source="hard")
+    monitor.printer.invoke_shutdown.assert_called_once()
+    assert monitor._recovery.state is RecoveryState.FAILED
