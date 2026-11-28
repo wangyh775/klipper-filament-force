@@ -1197,7 +1197,7 @@ class FilamentForce:
                 mean_g=mean_g, stdev_g=stdev_g, z_score=z_s,
                 anomaly=kind_s, learned=bool(learned_i))
         if self._recovery.attempts:
-            healthy = (not short_bead and not validating and hist.learned
+            healthy = (not short_bead and not validating and bin_was_learned and hist.learned
                        and high_band is not None
                        and high_band.kind is force_signal.AnomalyKind.NONE
                        and trip is None and not book.jam_suspect
@@ -1637,6 +1637,7 @@ class FilamentForce:
         except Exception:
             d.abort()
             self._recovery.fail("diagnostic exception")
+            self._publish_event("recovery_failed", reason="diagnostic exception")
             logging.exception("filament_force free-air diagnosis failed")
             raise
         finally:
@@ -1692,6 +1693,7 @@ class FilamentForce:
                 self._resume_after_diagnosis(generation)
         else:
             self._recovery.fail(d.result.value)
+            self._publish_event("recovery_failed", reason=d.result.value)
 
     def _resume_after_diagnosis(self, generation: int) -> None:
         ctl = self.first_layer
@@ -1856,10 +1858,13 @@ class FilamentForce:
         first = self._incident_layer == 1
         needed = self.first_layer_verify_windows if first else self.auto_resume_verify_windows
         recovery = self._recovery
+        before = recovery.before_z
         if recovery.observe(band, needed):
             book.clear_streaks()
             self._publish_event("recovery_verified", attempts=recovery.attempts,
-                                before_z_score=recovery.before_z, after_z_score=band.z_score)
+                                before_z_score=before, after_z_score=band.z_score,
+                                improvement=(1 - band.z_score / before
+                                             if before is not None and before > 0 else None))
             self._reset_stability()
             self.gcode.respond_info("filament_force: recovery verified")
             return
@@ -1951,8 +1956,11 @@ class FilamentForce:
         try:
             if not self._jam_action_paused():
                 self.gcode.run_script_from_command("PAUSE\nM400")
-            if generation != self._diag_generation or not self._jam_action_paused():
+            if generation != self._diag_generation:
+                return
+            if not self._jam_action_paused():
                 self._recovery.fail("pause not acknowledged")
+                self._publish_event("recovery_failed", reason="pause not acknowledged")
                 return
             self.actions.run_template_if_set(MonitorTemplate.JAM, {
                 "TOOL": tool, "REASON": "jam", "MSG": self.last_msg, "TARGET": target,
@@ -1974,6 +1982,7 @@ class FilamentForce:
                 self.reactor.register_callback(lambda _t: self._auto_diagnose(generation))
         except Exception:
             self._recovery.fail("preparation strategy failed")
+            self._publish_event("recovery_failed", reason="preparation strategy failed")
             logging.exception("filament_force pre-diagnosis strategy failed")
             if self.actions.is_printing() and not self._jam_action_paused():
                 self.gcode.run_script_from_command("PAUSE\nM400")
@@ -2037,18 +2046,23 @@ class FilamentForce:
                 logging.exception("filament_force: could not capture trip layer")
         self.last_msg = f"filament_force {kind.value} ({detail}; source={source})"
         if printing and getattr(self, "event_enabled", False):
-            stats_obj = self.printer.lookup_object("print_stats", None)
-            filename = stats_obj.get_status(self.reactor.monotonic()).get("filename", "") if stats_obj is not None else ""
-            self._incident_id = None
-            event = self._publish_event(
-                "jam_detected" if kind is TripKind.JAM else "runout_detected",
-                source=source, force_g=force_g, layer=self._incident_layer,
-                tool=tool, e_speed_mm_s=self._incident_speed, target_c=target,
-                filename=filename, window=self._event_journal.trace(
-                    self._force_ref if self._force_ref_locked else None),
-            )
-            if event is not None:
-                self._incident_id = str(event["event_id"])
+            try:
+                stats_obj = self.printer.lookup_object("print_stats", None)
+                filename = stats_obj.get_status(self.reactor.monotonic()).get("filename", "") if stats_obj is not None else ""
+                self._incident_id = None
+                event = self._publish_event(
+                    "jam_detected" if kind is TripKind.JAM else "runout_detected",
+                    source=source, force_g=force_g, layer=self._incident_layer,
+                    tool=tool, e_speed_mm_s=self._incident_speed, target_c=target,
+                    filename=filename, window=self._event_journal.trace(
+                        self._force_ref if self._force_ref_locked else None),
+                    detection_length_mm=self.detection_length,
+                    absolute_limit_g=self.oh_shit_force,
+                )
+                if event is not None:
+                    self._incident_id = str(event["event_id"])
+            except Exception:
+                logging.exception("filament_force trip telemetry failed")
         if kind is TripKind.RUNOUT:
             self._recovery.fail("runout")
             try:
@@ -2081,7 +2095,7 @@ class FilamentForce:
         if not healthy:
             self._reset_stability()
             return
-        if self._stable_last is None or now - self._stable_last > self.confirm_max_gap_s:
+        if self._stable_last is None or not 0 <= now - self._stable_last <= self.confirm_max_gap_s:
             self._stable_since = now
             self._stable_windows = 0
         self._stable_last = now
