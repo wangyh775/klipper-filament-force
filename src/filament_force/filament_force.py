@@ -38,6 +38,7 @@ from .first_layer import FirstLayerZControl
 from .model_store import ModelStore, snapshot
 from .free_air import Diagnosis, FreeAirDiagnostic
 from .recovery import ForceReference, Recovery, RecoveryState, shifted_pause_state
+from .z_ownership import ZOwnership
 from .events import EventJournal
 from .protection import SampleHealth, StableBaseline
 
@@ -282,7 +283,7 @@ class FilamentForce:
         self._incident_recoverable = False
         self._live_e_speed = 0.0
         self._live_e_at: float | None = None
-        self._recovery_z_origin: float | None = None
+        self._z_ownership = ZOwnership()
         self.diagnostic_limit = config.getfloat("diagnostic_force_limit", 0.0, minval=0.0)
         self.diagnostic_low = config.getfloat("diagnostic_force_min", 0.0, minval=0.0)
         self.diagnostic_high = config.getfloat("diagnostic_force_max", 0.0, minval=0.0)
@@ -440,6 +441,10 @@ class FilamentForce:
         )
 
         self._register_jam_action(config)
+        self.gcode.register_command(
+            "FILAMENT_FORCE_Z_ACK", self.cmd_FILAMENT_FORCE_Z_ACK,
+            desc="Acknowledge manually reconciled previous Z correction while idle",
+        )
         self.gcode.register_command(
             "FILAMENT_FORCE_DIAG_READY", self.cmd_FILAMENT_FORCE_DIAG_READY,
             desc="Acknowledge safe floating nozzle after pre-diagnosis strategy",
@@ -772,30 +777,50 @@ class FilamentForce:
         self._diag_attempted = False
         self._diag_trip_source = ""
         self._diag_first_layer = False
-        applied = self.first_layer.applied_mm
-        origin = self._recovery_z_origin
-        self._recovery_z_origin = None
         self.first_layer.reset()
-        if applied:
+        if self._z_ownership.finish_job():
             generation = self._diag_generation
-            self.reactor.register_callback(
-                lambda _t: self._undo_recovery_z(generation, applied, origin)
-            )
+            self.reactor.register_callback(lambda _t: self._undo_recovery_z(generation))
 
-    def _undo_recovery_z(self, generation: int, applied: float,
-                         origin: float | None) -> None:
-        # Never overwrite a new job or an unrelated coordinate reset.
+    def _undo_recovery_z(self, generation: int) -> None:
+        # Do not delete ownership until the physical coordinate origin is verified.
         with self.gcode.get_mutex():
-            actual = self._current_z_origin()
-            if (generation != self._diag_generation or self.actions.in_print_job()
-                or origin is None or actual is None or abs(actual - origin) > 1e-6):
-                self.gcode.respond_info(
-                    "filament_force: verify previous job's Z offset manually"
-                )
+            if generation != self._diag_generation:
+                return  # the newer reset owns the cleanup callback
+            owned = self._z_ownership
+            if not owned.cleanup_pending:
                 return
-            self.gcode.run_script_from_command(
-                f"SET_GCODE_OFFSET Z_ADJUST={-applied:.6f} MOVE=0"
-            )
+            try:
+                if self.actions.in_print_job():
+                    raise ValueError("another print started")
+                actual = self._current_z_origin()
+                target = owned.cleanup_target(actual)
+                self.gcode.run_script_from_command(
+                    f"SET_GCODE_OFFSET Z_ADJUST={-owned.applied_mm:.6f} MOVE=0"
+                )
+                if generation != self._diag_generation or self.actions.in_print_job():
+                    raise ValueError("job changed during cleanup")
+                owned.confirm_cleanup(self._current_z_origin(), target)
+            except Exception:
+                owned.mark_uncertain()
+                logging.exception("filament_force Z cleanup requires inspection")
+                self.gcode.respond_info(
+                    "filament_force: verify previous job's Z offset manually; "
+                    "after reconciliation at idle use FILAMENT_FORCE_Z_ACK CONFIRM=1"
+                )
+
+    def cmd_FILAMENT_FORCE_Z_ACK(self, gcmd: GCodeCommand) -> None:
+        if self.actions.in_print_job() or self._diag.active or self._resume_capture is not None:
+            raise gcmd.error("filament_force: Z acknowledgement requires idle printer")
+        if gcmd.get_int("CONFIRM", 0, minval=0, maxval=1) != 1:
+            raise gcmd.error("Verify and reconcile physical Z offset first; CONFIRM=1")
+        if not self._z_ownership.cleanup_pending:
+            raise gcmd.error("filament_force: no pending Z ownership reconciliation")
+        self.gcode.run_script_from_command("M400")
+        if self.actions.in_print_job() or self._current_z_origin() is None:
+            raise gcmd.error("filament_force: cannot confirm idle coordinate state")
+        self._z_ownership.clear()
+        gcmd.respond_info("filament_force: manual Z reconciliation acknowledged; no offset applied")
 
     def _current_z_origin(self) -> float | None:
         move = self.printer.lookup_object("gcode_move", None)
@@ -951,7 +976,9 @@ class FilamentForce:
         if self._watchdog_started is None:
             self._watchdog_started = eventtime
         reason = ""
-        if self.actions.pending_recheck:
+        if self._z_ownership.cleanup_pending:
+            reason = "unresolved previous Z compensation"
+        elif self.actions.pending_recheck:
             reason = "unacknowledged fault pause or bypassed resume"
         elif self._sample_health.stale(eventtime, self._watchdog_started, self.sensor_timeout_s):
             reason = "load cell stream stale"
@@ -1817,6 +1844,7 @@ class FilamentForce:
             or self._incident_layer is None or not self.enabled or self.suppress
             or not self._diagnostic_ready(generation)
             or not self.actions.has_template.get(MonitorTemplate.RESUME)
+            or self._z_ownership.cleanup_pending
         ):
             self.gcode.respond_info("filament_force: auto resume unavailable; remains paused")
             return
@@ -1892,6 +1920,11 @@ class FilamentForce:
             if updated is not None:
                 if not isinstance(states, dict) or states.get("PAUSE_STATE") is not old_state:
                     raise RuntimeError("pause state changed during resume preparation")
+                # Journal intent before modifying the saved coordinate state.
+                previous = self._current_z_origin()
+                if expected_origin is None:
+                    raise RuntimeError("corrected Z origin unavailable")
+                self._z_ownership.stage(previous, expected_origin, step)
                 states["PAUSE_STATE"] = updated
             book.clear_streaks()
             self._window.reset()
@@ -1912,10 +1945,8 @@ class FilamentForce:
                 raise RuntimeError("resume did not clear pause")
             if expected_origin is not None:
                 actual = self._current_z_origin()
-                if actual is None or abs(actual - expected_origin) > 1e-6:
-                    raise RuntimeError("resume did not restore corrected Z offset")
+                self._z_ownership.commit(actual)
                 ctl.record_adjustment(self.reactor.monotonic())
-                self._recovery_z_origin = actual
             # Discard resume-macro motion from statistical windows, not the
             # qualified tare or hard-force dwell.
             self._window.reset()
@@ -1934,15 +1965,25 @@ class FilamentForce:
             logging.exception("filament_force automatic resume failed")
             if generation != self._diag_generation:
                 return
-            # If the adjusted origin took effect, own it even on later failure.
-            if updated is not None and expected_origin is not None:
-                actual = self._current_z_origin()
-                if actual is not None and abs(actual - expected_origin) <= 1e-6:
-                    if self._recovery_z_origin != actual:
+            # Resolve a staged correction only from observed coordinates and
+            # the actual saved state. Ambiguity requires manual reconciliation.
+            owned = self._z_ownership
+            if owned.staged_step:
+                try:
+                    actual = self._current_z_origin()
+                    if owned.matches_expected(actual):
+                        owned.commit(actual)
                         ctl.record_adjustment(self.reactor.monotonic())
-                        self._recovery_z_origin = actual
-                elif isinstance(states, dict) and states.get("PAUSE_STATE") is updated:
-                    states["PAUSE_STATE"] = old_state
+                    elif (owned.matches_before(actual) and isinstance(states, dict)
+                          and (states.get("PAUSE_STATE") is updated
+                               or states.get("PAUSE_STATE") is old_state)):
+                        states["PAUSE_STATE"] = old_state
+                        owned.rollback(actual)
+                    else:
+                        owned.mark_uncertain()
+                except Exception:
+                    owned.mark_uncertain()
+                    logging.exception("filament_force cannot resolve staged Z correction")
             self._pause_recovery("resume failed", tool, target)
 
     def _pause_recovery(self, reason: str, tool: int, target: float) -> None:
@@ -2317,6 +2358,7 @@ class FilamentForce:
             "recovery_ordinary_attempts": self._recovery.ordinary_attempts,
             "recovery_manual_attempts": self._recovery.manual_attempts,
             "recovery_job_max_attempts": self.auto_resume_job_max_attempts,
+            "z_ownership": self._z_ownership.status(),
             "events": self._event_journal.status(),
             "recovery_healthy_windows": self._recovery.healthy,
             "recovery_failure": self._recovery.failure,
@@ -2686,6 +2728,8 @@ class FilamentForce:
                 RecoveryState.PREPARING, RecoveryState.RESUMING, RecoveryState.VERIFYING):
             raise gcmd.error("filament_force: diagnosis or automatic recovery still running")
         velocity = gcmd.get("VELOCITY", None)
+        if self._z_ownership.cleanup_pending:
+            raise gcmd.error("filament_force: unresolved Z compensation; cancel and reconcile at idle")
         if not self.actions.pending_recheck:
             if self.actions.in_print_job():
                 self.actions.do_resume(velocity)

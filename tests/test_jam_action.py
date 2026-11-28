@@ -13,6 +13,7 @@ from filament_force.force_signal import EWindowAccumulator, TripKind
 from filament_force.pause import MonitorActions, MonitorTemplate
 from filament_force.recovery import Recovery, RecoveryState
 from filament_force.protection import SampleHealth
+from filament_force.z_ownership import ZOwnership
 
 
 @pytest.fixture
@@ -64,6 +65,7 @@ def monitor(
     result._armed = True
     result._diag_generation = 0
     result._recovery = Recovery()
+    result._z_ownership = ZOwnership()
     result._last_e_speed = 1.5
     result._live_e_speed = 0.0
     result._live_e_at = None
