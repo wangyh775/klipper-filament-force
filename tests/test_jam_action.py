@@ -9,6 +9,7 @@ from filament_force.filament_force import FilamentForce
 from filament_force.first_layer import FirstLayerZControl
 from filament_force.force_signal import EWindowAccumulator, TripKind
 from filament_force.pause import MonitorActions, MonitorTemplate
+from filament_force.recovery import Recovery, RecoveryState
 
 
 @pytest.fixture
@@ -59,6 +60,12 @@ def monitor(
     result._triggering = result._test_runout = result.suppress = False
     result._armed = True
     result._diag_generation = 0
+    result._recovery = Recovery()
+    result._last_e_speed = 1.5
+    result._live_e_speed = 0.0
+    result._live_e_at = None
+    result.diagnostic_enabled = False
+    result.diagnostic_auto = False
     result._window = EWindowAccumulator(detection_length=8.0, rolling_window_s=0.1)
     return result
 
@@ -71,59 +78,62 @@ def configure_action(monitor: FilamentForce, name: str | None = None) -> None:
     monitor._register_jam_action(config)
 
 
-def test_builtin_action_is_registered_and_uses_pause(
+def test_both_weak_actions_are_registered(
     monitor: FilamentForce, gcode: Mock
 ) -> None:
     configure_action(monitor)
-    gcode.register_command.assert_called_once_with(
-        "FILAMENT_FORCE_JAM_ACTION", monitor._default_jam_action
-    )
+    assert gcode.register_command.call_args_list == [
+        call("FILAMENT_FORCE_JAM_ACTION", monitor._default_jam_action),
+        call("FILAMENT_FORCE_CONFIRMED_JAM_ACTION", monitor._default_confirmed_jam_action),
+    ]
     monitor._default_jam_action(Mock())
     gcode.run_script_from_command.assert_called_once_with("PAUSE\nM400")
 
 
-def test_custom_action_overrides_builtin_and_monitor_can_retry(
-    monitor: FilamentForce,
-    gcode: Mock,
-    legacy_hook: Mock,
+def test_custom_action_overrides_only_its_own_hook(
+    monitor: FilamentForce, gcode: Mock
 ) -> None:
     configure_action(monitor, "gcode_macro filament_force_jam_action")
-    gcode.register_command.assert_not_called()
-    for _ in range(2):
-        monitor._trip(TripKind.JAM, "700g", source="band", force_g=700.0)
-        assert not monitor.actions.pending_recheck
-        assert not monitor._triggering
-
-    assert (
-        gcode.run_script_from_command.call_args_list
-        == [
-            call(
-                "FILAMENT_FORCE_JAM_ACTION TOOL=0 FORCE_G=700.000 TARGET=400.00 FIRST_LAYER=1"
-            )
-        ]
-        * 2
+    gcode.register_command.assert_called_once_with(
+        "FILAMENT_FORCE_CONFIRMED_JAM_ACTION", monitor._default_confirmed_jam_action
     )
-    assert legacy_hook.call_args.args[0] is MonitorTemplate.JAM
+    gcode.reset_mock()
+    configure_action(monitor, "gcode_macro filament_force_confirmed_jam_action")
+    gcode.register_command.assert_called_once_with(
+        "FILAMENT_FORCE_JAM_ACTION", monitor._default_jam_action
+    )
 
 
-def test_custom_pause_preserves_fault_context(
-    monitor: FilamentForce, gcode: Mock, stats: Mock
+@pytest.mark.parametrize("source", ["band", "hard", "model_validation"])
+def test_both_detectors_pause_then_invoke_preparation(
+    monitor: FilamentForce, gcode: Mock, stats: Mock, legacy_hook: Mock,
+    source: str,
 ) -> None:
     configure_action(monitor, "gcode_macro FILAMENT_FORCE_JAM_ACTION")
 
-    def run(_script: str) -> None:
-        stats.get_status.return_value = {"state": "paused"}
+    def run(script: str) -> None:
+        if script == "PAUSE\nM400":
+            stats.get_status.return_value = {"state": "paused"}
 
     gcode.run_script_from_command.side_effect = run
-    monitor._trip(TripKind.JAM, "700g", source="band", force_g=700.0)
-
+    monitor._trip(TripKind.JAM, "700g", source=source, force_g=700.0)
     assert monitor.actions.pending_recheck
     assert monitor.actions.pending_tool == 0
     assert monitor.actions.pending_target == 400.0
     assert monitor.actions.pending_reason == "jam"
+    assert monitor._recovery.state is RecoveryState.WAITING_DIAGNOSIS
+    assert gcode.run_script_from_command.call_args_list == [
+        call("PAUSE\nM400"),
+        call("FILAMENT_FORCE_JAM_ACTION TOOL=0 FORCE_G=700.000 TARGET=400.00 FIRST_LAYER=1"
+             f" SOURCE={source} E_SPEED={0.0 if source == 'hard' else 1.5:.3f}"),
+        call("M400"),
+    ]
+    assert legacy_hook.call_args.args[0] is MonitorTemplate.JAM
+    assert not monitor._recovery.clearance
+    assert not monitor._triggering
 
 
-def test_failing_custom_action_falls_back_to_pause(
+def test_failing_custom_action_keeps_pause(
     monitor: FilamentForce, gcode: Mock, stats: Mock
 ) -> None:
     configure_action(monitor, "gcode_macro FILAMENT_FORCE_JAM_ACTION")
@@ -135,27 +145,27 @@ def test_failing_custom_action_falls_back_to_pause(
 
     gcode.run_script_from_command.side_effect = run
     monitor._trip(TripKind.JAM, "700g", source="band", force_g=700.0)
-
-    assert gcode.run_script_from_command.call_args_list[-1] == call("PAUSE\nM400")
+    assert monitor._recovery.state is RecoveryState.FAILED
     assert monitor.actions.pending_recheck
+    assert stats.get_status.return_value["state"] == "paused"
 
 
-@pytest.mark.parametrize(
-    ("kind", "source"),
-    [
-        (TripKind.JAM, "hard"),
-        (TripKind.JAM, "model_validation"),
-        (TripKind.RUNOUT, "band"),
-    ],
-)
-def test_protective_trips_keep_normal_pause(
-    monitor: FilamentForce, gcode: Mock, kind: TripKind, source: str
+def test_runout_retains_independent_pause(
+    monitor: FilamentForce, gcode: Mock
 ) -> None:
     configure_action(monitor, "gcode_macro FILAMENT_FORCE_JAM_ACTION")
-    monitor._trip(kind, "fault", source=source)
-
+    monitor._trip(TripKind.RUNOUT, "fault", source="band")
     assert gcode.run_script_from_command.call_args_list == [
         call("PAUSE"),
         call("M400"),
     ]
     assert monitor.actions.pending_recheck
+
+
+def test_no_pause_ack_blocks_preparation(
+    monitor: FilamentForce, gcode: Mock
+) -> None:
+    configure_action(monitor)
+    monitor._trip(TripKind.JAM, "fault", source="band")
+    assert monitor._recovery.state is RecoveryState.FAILED
+    assert gcode.run_script_from_command.call_args_list == [call("PAUSE\nM400")]
