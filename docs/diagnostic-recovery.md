@@ -1,5 +1,7 @@
 # Unified jam diagnosis and bounded recovery
 
+[简体中文](diagnostic-recovery.zh-CN.md) | English
+
 ## Design contract (experimental)
 
 Keep the existing per-speed-bin force model, statistical confirmation and independent hard-force threshold. No new rebound detector, periodicity algorithm, free-air training model or automatic PA tuning.
@@ -20,7 +22,7 @@ With opt-in automatic recovery, WAITING_RECOVERY → RESUMING → VERIFYING → 
 
 ## Diagnosis
 
-Reuse the existing short forward extrusion pulses and the learned printing speed-bin reference, frozen at incident start; select the diagnostic speed near the triggering speed within the tested pulse-duration/speed limits. The diagnostic mean is not exactly the print-window statistic: a healthy-looking force is evidence against a gross restriction, not proof of normal flow. If no matching learned reference exists, require explicit calibrated manual bounds or remain inconclusive. Never train on fault-test data. A force cap stops subsequent pulses, not an in-flight move; it is an inconclusive safety stop, not authorization to run the confirmed-jam action.
+Reuse the existing short forward extrusion pulses and the learned printing speed-bin reference, frozen at incident start; default to a fixed configured E-axis speed of 3 mm/s (0.5–6 mm/s); optional matching uses the triggering speed up to this configured ceiling. Actual pulse length is max(configured minimum, speed × 0.5 s), bounded to 3 mm; the default at 3 mm/s is 1.5 mm per pulse. Retain the 20%/same-bin automatic-recovery gate. The diagnostic mean is not exactly the print-window statistic: a healthy-looking force is evidence against a gross restriction, not proof of normal flow. If no matching learned reference exists, require explicit calibrated manual bounds or remain inconclusive. Never train on fault-test data. A force cap stops subsequent pulses, not an in-flight move; it is an inconclusive safety stop, not authorization to run the confirmed-jam action.
 
 ## Recovery
 
