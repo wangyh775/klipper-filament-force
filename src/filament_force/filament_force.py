@@ -289,6 +289,7 @@ class FilamentForce:
             "runout_max_level_g", 80.0, minval=0.0
         )
         self.confirm_windows: int = config.getint("confirm_windows", 3, minval=1)
+        self.confirm_max_gap_s: float = config.getfloat("confirm_max_gap_s", 30.0, above=0.0)
         self.recover_windows: int = config.getint("recover_windows", 2, minval=1)
         self.history_n: int = config.getint("history_n", 16, minval=5)
         self.min_learn_windows: int = config.getint("min_learn_windows", 5, minval=2)
@@ -705,6 +706,11 @@ class FilamentForce:
         del args
         self._save_model_store(checkpoint=True)
         self._diag_generation += 1
+        for book in self.books.values():
+            book.clear_streaks()
+        for key in self._restored_bins:
+            self._restored_bins[key] = 0
+        self._jam_above_since = None
         if self._diag.active:
             self._diag.abort()
         self._diag_attempted = False
@@ -952,8 +958,9 @@ class FilamentForce:
                             )
                         )
                         self.reactor.register_callback(
-                            lambda et, raw=raw: self._trip(
-                                TripKind.JAM, f"{raw:.0f}g"
+                            lambda et, raw=raw, gen=self._diag_generation: self._trip(
+                                TripKind.JAM, f"{raw:.0f}g", source="hard",
+                                force_g=raw, expected_generation=gen,
                             )
                         )
                     self._jam_above_since = None
@@ -1081,6 +1088,8 @@ class FilamentForce:
             drop_ratio=self.drop_ratio,
             runout_max_level_g=self.runout_max_level_g,
             trip_high=self.sigma_jam,
+            eventtime=eventtime,
+            max_gap_s=self.confirm_max_gap_s,
         )
         if validating and not short_bead:
             self._ff_log("model_validate", {
@@ -1158,6 +1167,8 @@ class FilamentForce:
                 "trip",
                 {
                     "kind": trip_kind.value,
+                    "reason": "model_validation" if validating else "band",
+                    "confirm_windows": self.confirm_windows,
                     "tool": self.active_tool,
                     "bin": bin_i,
                     "raw_g": f"{raw_g:.1f}",
@@ -1170,8 +1181,8 @@ class FilamentForce:
         detail = f"{raw_g:.0f}g"
         source = "model_validation" if validating else "band"
         self.reactor.register_callback(
-            lambda et, k=trip_kind, d=detail, raw=raw_g, src=source: self._trip(
-                k, d, source=src, force_g=raw
+            lambda et, k=trip_kind, d=detail, raw=raw_g, src=source, gen=self._diag_generation: self._trip(
+                k, d, source=src, force_g=raw, expected_generation=gen,
             )
         )
         return next_time
@@ -1622,7 +1633,10 @@ class FilamentForce:
     def _trip(
         self, kind: TripKind, detail: str,
         *, source: str = "hard", force_g: float = 0.0,
+        expected_generation: int | None = None,
     ) -> None:
+        if expected_generation is not None and expected_generation != self._diag_generation:
+            return
         if self._triggering or self.actions.pending_recheck:
             return
         generation = self._diag_generation
@@ -1669,7 +1683,7 @@ class FilamentForce:
                     )
             except Exception:
                 logging.exception("filament_force: could not capture trip layer")
-        self.last_msg = f"filament_force {kind.value} ({detail})"
+        self.last_msg = f"filament_force {kind.value} ({detail}; source={source})"
         template_key = (
             MonitorTemplate.RUNOUT
             if kind is TripKind.RUNOUT
@@ -1763,6 +1777,9 @@ class FilamentForce:
             "last_z_score": last_z,
             "suspect": 1 if book.jam_suspect else 0,
             "anomalous_streak": book.jam_streak,
+            "confirm_windows": self.confirm_windows,
+            "confirm_max_gap_s": self.confirm_max_gap_s,
+            "last_trip_source": self._diag_trip_source,
             "healthy_streak": book.jam_healthy_streak,
             "last_probe_spike": self._spike.last_spike,
             "last_probe_delta_g": self._spike.last_delta_g,
@@ -1986,13 +2003,15 @@ class FilamentForce:
             f" e_speed={self._last_e_speed:.2f}mm/s"
             f" z={last_z:.2f} kind={last_kind}\n"
             f"  suspect={'yes' if book.jam_suspect else 'no'}"
-            f" anom_streak={book.jam_streak}"
+            f" anom_streak={book.jam_streak}/{self.confirm_windows}"
+            f" max_gap={self.confirm_max_gap_s:.1f}s"
             f" healthy_streak={book.jam_healthy_streak}\n"
             f"  check_spike={'yes' if self._spike.active else 'no'}"
             f" last_spike={'yes' if self._spike.last_spike else 'no'}"
             f" spike_delta={self._spike.last_delta_g:.1f}g\n"
             f"  pending={self.actions.pending_recheck}"
             f" last_trip={self.last_trip.value if self.last_trip else '-'}"
+            f" source={self._diag_trip_source or '-'}"
         )
 
     cmd_FILAMENT_FORCE_SET_TOOL_help = (
@@ -2072,6 +2091,12 @@ class FilamentForce:
         self.actions.clear_pending()
         book = self._book_for(tool if tool >= 0 else self.active_tool)
         book.clear_streaks()
+        tool_key = tool if tool >= 0 else self.active_tool
+        tool_key = tool_key if tool_key >= 0 else -1
+        for key in self._restored_bins:
+            if key[0] == tool_key:
+                self._restored_bins[key] = 0
+        self._jam_above_since = None
         self._window.reset()
         self._spike.abort()
         self.actions.run_template_if_set(
