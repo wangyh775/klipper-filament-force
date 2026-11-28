@@ -125,6 +125,32 @@ snapshot, acknowledging success only after the write finishes. A write
 failure or timeout is reported; do not assume reset survived power loss.
 Back up the JSON file before manual edits.
 
+## Custom jam action
+
+On a learned-band JAM trip, the plugin runs `FILAMENT_FORCE_JAM_ACTION`.
+The built-in action runs `PAUSE` and `M400`. Define a macro with the same
+name in your printer config to override that action. No `rename_existing`
+setting is needed. For example, this action reports the measured force and
+chooses to pause:
+
+```ini
+[gcode_macro FILAMENT_FORCE_JAM_ACTION]
+gcode:
+    RESPOND MSG="Filament force jam on T{params.TOOL}, {params.FORCE_G}g"
+    PAUSE
+```
+
+The macro receives `TOOL`, `FORCE_G`, `TARGET` (the original nozzle target
+in Celsius), and `FIRST_LAYER` (`1` when layer 1 was confirmed, otherwise
+`0`). The plugin keeps its fault context if the macro pauses the print.
+If the macro leaves the print running, monitoring continues and can trip
+again. If the macro raises an error while the job is still printing, the
+plugin falls back to `PAUSE`. A custom action calling `PAUSE` controls
+whether it also needs `M400` for any moves it issues.
+
+The optional `jam_gcode` hook still runs ahead of the action. Absolute-force
+trips, model-validation trips, and runout trips use the normal pause path.
+
 ## Supervised free-air diagnosis (experimental)
 
 After an ordinary learned-band JAM pause, the operator may verify that
