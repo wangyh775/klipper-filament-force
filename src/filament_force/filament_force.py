@@ -729,6 +729,7 @@ class FilamentForce:
         self._diag_generation += 1
         self._recovery = Recovery()
         self._incident_recoverable = False
+        self.actions.clear_pending()
         for book in self.books.values():
             book.clear_streaks()
         for key in self._restored_bins:
@@ -1622,7 +1623,7 @@ class FilamentForce:
         if not self._diagnostic_ready(generation):
             self._recovery.fail("diagnostic context changed")
             return
-        if d.result in (Diagnosis.RESTRICTION_SUSPECTED, Diagnosis.FORCE_LIMIT):
+        if d.result is Diagnosis.RESTRICTION_SUSPECTED:
             self._recovery.state = RecoveryState.CONFIRMED_JAM
             mean = max((p.mean_g for p in d.pulses), default=0.0)
             peak = max((p.peak_g for p in d.pulses), default=0.0)
@@ -1709,7 +1710,8 @@ class FilamentForce:
                 return
         recovery.state = RecoveryState.RESUMING
         recovery.attempts += 1
-        recovery.before_z = ref.score(self._incident_force).z_score
+        recovery.before_z = (ref.score(self._incident_force).z_score
+                             if self._diag_trip_source == "band" else None)
         target = self.actions.pending_target
         try:
             self.actions.run_template_if_set(MonitorTemplate.RECOVER, {
@@ -1878,15 +1880,10 @@ class FilamentForce:
             self.gcode.run_script_from_command("PAUSE\nM400")
 
     def _jam_action_paused(self) -> bool:
-        state = self.actions.print_stats_state()
-        if state == "paused":
-            return True
         pause = self.printer.lookup_object("pause_resume", None)
-        return (
-            state == "printing"
-            and pause is not None
-            and bool(pause.get_status(self.reactor.monotonic()).get("is_paused"))
-        )
+        if pause is not None:
+            return bool(pause.get_status(self.reactor.monotonic()).get("is_paused"))
+        return self.actions.print_stats_state() == "paused"
 
     def _run_jam_action(self, tool: int, target: float, force_g: float) -> None:
         self.actions.set_pending(tool=tool, target=target, reason=TripKind.JAM.value)
@@ -1896,6 +1893,9 @@ class FilamentForce:
         try:
             if not self._jam_action_paused():
                 self.gcode.run_script_from_command("PAUSE\nM400")
+            if generation != self._diag_generation or not self._jam_action_paused():
+                self._recovery.fail("pause not acknowledged")
+                return
             self.actions.run_template_if_set(MonitorTemplate.JAM, {
                 "TOOL": tool, "REASON": "jam", "MSG": self.last_msg, "TARGET": target,
             })
@@ -1977,26 +1977,15 @@ class FilamentForce:
             except Exception:
                 logging.exception("filament_force: could not capture trip layer")
         self.last_msg = f"filament_force {kind.value} ({detail}; source={source})"
-        template_key = (
-            MonitorTemplate.RUNOUT
-            if kind is TripKind.RUNOUT
-            else MonitorTemplate.JAM
-        )
-        try:
-            if kind is TripKind.RUNOUT:
-                self._recovery.fail("runout")
-            if kind is TripKind.RUNOUT:
-                self.actions.run_template_if_set(
-                    template_key,
-                {
-                    "TOOL": tool,
-                    "REASON": kind.value,
-                    "MSG": self.last_msg,
-                    "TARGET": target,
-                },
-            )
-        except Exception:
-            logging.exception("filament_force: pre-action G-code hook failed")
+        if kind is TripKind.RUNOUT:
+            self._recovery.fail("runout")
+            try:
+                self.actions.run_template_if_set(MonitorTemplate.RUNOUT, {
+                    "TOOL": tool, "REASON": kind.value,
+                    "MSG": self.last_msg, "TARGET": target,
+                })
+            except Exception:
+                logging.exception("filament_force: runout hook failed")
         if not printing:
             self._log_info(f"{self.last_msg}. Idle test - no pause.")
         elif self.actions.in_print_job():
@@ -2314,7 +2303,11 @@ class FilamentForce:
             f" spike_delta={self._spike.last_delta_g:.1f}g\n"
             f"  pending={self.actions.pending_recheck}"
             f" last_trip={self.last_trip.value if self.last_trip else '-'}"
-            f" source={self._diag_trip_source or '-'}"
+            f" source={self._diag_trip_source or '-'}\n"
+            f"  recovery={self._recovery.state.value}"
+            f" attempts={self._recovery.attempts}"
+            f" verified={self._recovery.healthy}"
+            f" failure={self._recovery.failure or '-'}"
         )
 
     cmd_FILAMENT_FORCE_SET_TOOL_help = (
@@ -2322,6 +2315,8 @@ class FilamentForce:
     )
 
     def cmd_FILAMENT_FORCE_SET_TOOL(self, gcmd: GCodeCommand) -> None:
+        if self._recovery.state in (RecoveryState.PREPARING, RecoveryState.RESUMING, RecoveryState.VERIFYING):
+            raise gcmd.error("filament_force: tool change during recovery is unsupported")
         if self._diag.active:
             raise gcmd.error("filament_force: diagnosis still running")
         tool = gcmd.get_int("TOOL")
@@ -2347,8 +2342,13 @@ class FilamentForce:
     )
 
     def cmd_FILAMENT_FORCE_RESET(self, gcmd: GCodeCommand) -> None:
+        if self._recovery.state in (RecoveryState.PREPARING, RecoveryState.RESUMING, RecoveryState.VERIFYING):
+            raise gcmd.error("filament_force: cannot reset model during recovery")
         if self._diag.active:
             raise gcmd.error("filament_force: diagnosis still running")
+        self._diag_generation += 1
+        self._recovery.state = RecoveryState.MONITORING
+        self._recovery.clearance = False
         tool = gcmd.get_int("TOOL", self.active_tool)
         book = self._book_for(tool)
         book.reset()
@@ -2433,6 +2433,8 @@ class FilamentForce:
     )
 
     def cmd_FILAMENT_FORCE_SUPPRESS(self, gcmd: GCodeCommand) -> None:
+        if self._recovery.state in (RecoveryState.RESUMING, RecoveryState.VERIFYING):
+            raise gcmd.error("filament_force: cannot suppress recovery verification")
         enable = gcmd.get_int("ENABLE", minval=0, maxval=1)
         self.suppress = bool(enable)
         self._window.reset()
