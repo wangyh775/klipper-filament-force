@@ -286,3 +286,40 @@ def test_manual_recovery_preparation_failure_keeps_pending_reason(
     assert monitor._recovery.manual_attempts == 1
     assert monitor._recovery.attempts == 1
     gcode.run_script_from_command.assert_not_called()
+
+
+def test_failure_transition_publishes_once(monitor: FilamentForce, monkeypatch: pytest.MonkeyPatch) -> None:
+    publish = Mock()
+    monkeypatch.setattr(monitor, "_publish_event", publish)
+    monitor._recovery.prepare()
+    monitor._fail_recovery("timeout")
+    monitor._fail_recovery("timeout")
+    publish.assert_called_once_with("recovery_failed", reason="timeout", previous_state="preparing")
+    monitor._recovery.prepare()
+    monitor._fail_recovery("timeout")
+    assert publish.call_count == 2
+
+
+def test_watchdog_sensor_event_links_failure(monitor: FilamentForce, gcode: Mock,
+                                             stats: Mock, monkeypatch: pytest.MonkeyPatch) -> None:
+    from filament_force.events import EventJournal
+
+    monitor.enabled = True
+    monitor.event_enabled = True
+    monitor.sensor_name = "load_cell_probe"
+    monitor._sample_health = SampleHealth()
+    monitor._event_journal = EventJournal()
+    monitor._incident_id = None
+    monitor._incident_filename = ""
+    monitor._force_ref_locked = False
+    monitor._protection_queued = True
+    cast(Mock, monitor.reactor).monotonic.return_value = 3.0
+    gcode.run_script_from_command.side_effect = lambda _script: stats.get_status.configure_mock(
+        return_value={"state": "paused"}
+    )
+    monitor._stop_unprotected(monitor._diag_generation, "load cell stream stale")
+    events = monitor._event_journal.status()
+    assert [e["kind"] for e in events] == ["sensor_fault", "recovery_failed"]
+    assert events[0]["window"]["samples"] == []
+    assert events[1]["incident_id"] == events[0]["event_id"]
+    assert monitor.actions.pending_reason == "protection"
