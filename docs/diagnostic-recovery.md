@@ -22,7 +22,7 @@ With opt-in automatic recovery, WAITING_RECOVERY → RESUMING → VERIFYING → 
 
 ## Diagnosis
 
-Reuse the existing short forward extrusion pulses and the learned printing speed-bin reference, frozen at incident start; default to a fixed configured E-axis speed of 3 mm/s (0.5–6 mm/s); optional matching uses the triggering speed up to this configured ceiling. Actual pulse length is max(configured minimum, speed × 0.5 s), bounded to 3 mm; the default at 3 mm/s is 1.5 mm per pulse. Retain the 20%/same-bin automatic-recovery gate. The diagnostic mean is not exactly the print-window statistic: a healthy-looking force is evidence against a gross restriction, not proof of normal flow. If no matching learned reference exists, require explicit calibrated manual bounds or remain inconclusive. Never train on fault-test data. A force cap stops subsequent pulses, not an in-flight move; it is an inconclusive safety stop, not authorization to run the confirmed-jam action.
+Reuse the existing short forward extrusion pulses and the learned printing speed-bin reference, frozen at incident start; default to a fixed configured E-axis speed of 3 mm/s (0.5–6 mm/s); optional matching uses the triggering speed up to this configured ceiling. Actual pulse length is max(configured minimum, speed × 0.5 s), bounded to 3 mm; the default at 3 mm/s is 1.5 mm per pulse. Allow a diagnostic at or above the incident speed across trusted bins; a slower diagnostic must stay within 20% and the same bin. The diagnostic mean is not exactly the print-window statistic: a healthy-looking force is evidence against a gross restriction, not proof of normal flow. If no matching learned reference exists, require explicit calibrated manual bounds or remain inconclusive. Never train on fault-test data. A force cap stops subsequent pulses, not an in-flight move; it is an inconclusive safety stop, not authorization to run the confirmed-jam action.
 
 ## Recovery
 
@@ -33,3 +33,5 @@ Non-first layer: no Z correction; allow bounded automatic resume after a normal 
 ## Validation
 
 Test both original trip sources, both strategy hooks, missing clearance, no learned model, high/low/mixed/no-sample diagnosis, capped attempts, verification timeout, cancel/restart, stale callbacks and preservation of learned histories. First-layer offsets must be applied in a verified resume path and removed without overwriting unrelated user adjustments. Hardware qualification is required before enabling unattended actions. Keep defaults conservative. Implementation is on the experimental branch. Automatic diagnosis requires explicit safe-park acknowledgement, and automatic recovery requires an explicit tested resume_gcode. See README, configuration comments and the PR for validation status before enabling options.
+
+Reset the consecutive retry budget after a sustained healthy run (default 60 s), retaining a separate per-job total. See [event protocol](events.md).
