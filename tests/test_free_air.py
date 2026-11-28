@@ -73,3 +73,20 @@ def test_abort_never_reports_healthy() -> None:
     d.abort()
     assert not d.active
     assert d.result is Diagnosis.INCONCLUSIVE
+
+
+def test_internal_gap_cannot_be_hidden_by_endpoint_coverage() -> None:
+    d = setup()
+    d.capture(2.0)
+    for t in (2.2, 2.21, 2.22, 2.23, 2.77, 2.78, 2.79, 2.8):
+        d.note(Sample(t, 1070.0))
+    assert not d.record_pulse(2.0, 3.0)
+
+
+def test_duplicate_pulse_timestamps_rejected() -> None:
+    d = setup()
+    d.capture(2.0)
+    for i in range(21):
+        d.note(Sample(2.0 + i * .05, 1070.0))
+        d.note(Sample(2.0 + i * .05, 1070.0))
+    assert not d.record_pulse(2.0, 3.0)

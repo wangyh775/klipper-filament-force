@@ -68,3 +68,13 @@ def test_invalid_z_step_refused(step: float) -> None:
 def test_missing_pause_state_refused() -> None:
     with pytest.raises(ValueError):
         shifted_pause_state(None, 0.02)
+
+
+def test_verification_expires_both_streaks() -> None:
+    r = Recovery()
+    ref = reference()
+    r.start_verification(0, 60)
+    assert not r.observe(ref.score(500), 2, eventtime=1, max_gap_s=30)
+    assert not r.observe(ref.score(500), 2, eventtime=32, max_gap_s=30)
+    assert r.healthy == 1
+    assert r.observe(ref.score(500), 2, eventtime=33, max_gap_s=30)

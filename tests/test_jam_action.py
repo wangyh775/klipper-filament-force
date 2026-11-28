@@ -64,6 +64,7 @@ def monitor(
     result._last_e_speed = 1.5
     result._live_e_speed = 0.0
     result._live_e_at = None
+    result.diagnostic_max_sample_gap_s = 0.05
     result.diagnostic_enabled = False
     result.diagnostic_auto = False
     result._window = EWindowAccumulator(detection_length=8.0, rolling_window_s=0.1)

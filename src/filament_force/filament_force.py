@@ -288,6 +288,7 @@ class FilamentForce:
         self.diagnostic_pulse = config.getfloat("diagnostic_pulse_mm", 0.5, minval=0.5, maxval=3.0)
         self.diagnostic_count = config.getint("diagnostic_pulses", 3, minval=2, maxval=3)
         self.diagnostic_baseline_span = config.getfloat("diagnostic_baseline_span", 30.0, above=0.0)
+        self.diagnostic_max_sample_gap_s = config.getfloat("diagnostic_max_sample_gap_s", 0.05, above=0.0)
         # diagnostic_pulse_mm is a minimum length; actual pulses also cover
         # at least 0.5s at the selected speed (maximum 3 mm).
         self._diag = FreeAirDiagnostic()
@@ -1116,7 +1117,7 @@ class FilamentForce:
             })
         if self._recovery.state is RecoveryState.VERIFYING:
             if not short_bead:
-                self._verify_recovery_window(book, bin_i, raw_g)
+                self._verify_recovery_window(book, bin_i, raw_g, completed.e_speed, eventtime)
             return next_time
         hist = book.bin_hist(bin_i)
         bin_was_learned = hist.learned
@@ -1846,11 +1847,17 @@ class FilamentForce:
             self._pause_recovery(reason, self.active_tool, self.actions.extruder_target())
 
     def _verify_recovery_window(self, book: force_signal.ToolForceBook,
-                                bin_i: int, force: float) -> None:
+                                bin_i: int, force: float, speed: float,
+                                eventtime: float) -> None:
+        generation = self._diag_generation
+        if eventtime >= self._recovery.deadline:
+            self.reactor.register_callback(
+                lambda _t: self._stop_verification(generation, "verification timeout"))
+            return
         ref = self._force_reference(book, bin_i)
         key = self.active_tool if self.active_tool >= 0 else -1
         if ref is None or (key, bin_i) in self._restored_bins or (key, -1) in self._restored_bins:
-            self._recovery.healthy = 0
+            self._recovery.clear_evidence()
             return  # no trusted healthy evidence; independent timeout remains active
         band = ref.score(force)
         if book.runout.learned:
@@ -1866,7 +1873,7 @@ class FilamentForce:
         needed = self.first_layer_verify_windows if first else self.auto_resume_verify_windows
         recovery = self._recovery
         before = recovery.before_z
-        if recovery.observe(band, needed):
+        if recovery.observe(band, needed, eventtime=eventtime, max_gap_s=self.confirm_max_gap_s):
             book.clear_streaks()
             self._publish_event("recovery_verified", attempts=recovery.attempts,
                                 before_z_score=before, after_z_score=band.z_score,
@@ -1880,14 +1887,18 @@ class FilamentForce:
         generation = self._diag_generation
         can_retry = (
             band.kind is force_signal.AnomalyKind.HIGH
-            and (not first or recovery.improved(band.z_score, self.first_layer_min_improvement))
+            and (not first or (bin_i == force_signal.speed_bin_index(self._incident_speed, self.speed_bin_edges)
+                               and self._incident_speed > 0
+                               and abs(speed - self._incident_speed) <= 0.2 * self._incident_speed
+                               and recovery.improved(band.z_score, self.first_layer_min_improvement)))
             and (self.first_layer.adjustments < self.first_layer.max_adjustments if first
                  else recovery.attempts < self.auto_resume_max_attempts)
         )
         if can_retry:
             self.reactor.register_callback(
                 lambda _t: self._trip(TripKind.JAM, f"{force:.0f}g", source="band",
-                                      force_g=force, expected_generation=generation)
+                                      force_g=force, expected_generation=generation,
+                                       expected_state=RecoveryState.VERIFYING)
             )
         else:
             self.reactor.register_callback(
@@ -2010,7 +2021,10 @@ class FilamentForce:
         self, kind: TripKind, detail: str,
         *, source: str = "hard", force_g: float = 0.0,
         expected_generation: int | None = None,
+        expected_state: RecoveryState | None = None,
     ) -> None:
+        if expected_state is not None and self._recovery.state is not expected_state:
+            return
         if expected_generation is not None and expected_generation != self._diag_generation:
             return
         if self._triggering or self.actions.pending_recheck:
@@ -2019,7 +2033,8 @@ class FilamentForce:
         self._triggering = True
         try:
             with self.gcode.get_mutex():
-                if generation != self._diag_generation or self.actions.pending_recheck:
+                if (generation != self._diag_generation or self.actions.pending_recheck
+                        or (expected_state is not None and self._recovery.state is not expected_state)):
                     return
                 self._handle_trip(kind, detail, source, force_g)
         finally:
@@ -2046,7 +2061,7 @@ class FilamentForce:
         target = self.actions.extruder_target()
         self.last_trip = kind
         self._diag_attempted = False
-        self._diag = FreeAirDiagnostic()
+        self._diag = FreeAirDiagnostic(max_sample_gap_s=self.diagnostic_max_sample_gap_s)
         self._diag_trip_source = source
         self._diag_first_layer = False
         if kind is TripKind.JAM:

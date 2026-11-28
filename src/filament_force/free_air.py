@@ -41,6 +41,7 @@ class FreeAirDiagnostic:
     limit_hit: bool = False
     extruded_mm: float = 0.0
     capture_from: float | None = None
+    max_sample_gap_s: float = 0.05
 
     def begin(self, limit_g: float) -> None:
         self.active = True
@@ -68,9 +69,19 @@ class FreeAirDiagnostic:
         self.samples.clear()
         self.capture_from = start
 
+    def _coverage(self, samples: list[Sample], start: float, end: float) -> bool:
+        if len(samples) < 5 or end <= start:
+            return False
+        times = [s.timestamp for s in samples]
+        gap = self.max_sample_gap_s
+        return (times[0] - start <= gap + 1e-9
+                and end - times[-1] <= gap + 1e-9
+                and all(0 < b - a <= gap + 1e-9 for a, b in zip(times, times[1:])))
+
     def set_reference(self, start: float, end: float, max_span_g: float) -> bool:
-        values = [s.force for s in self.samples if start <= s.timestamp <= end]
-        if len(values) < 5 or max(values) - min(values) > max_span_g:
+        selected = [s for s in self.samples if start <= s.timestamp <= end]
+        values = [s.force for s in selected]
+        if not self._coverage(selected, start, end) or max(values) - min(values) > max_span_g:
             return False
         self.reference = median(values)
         self.samples.clear()
@@ -85,7 +96,7 @@ class FreeAirDiagnostic:
         a = start + 0.2 * (end - start)
         b = end - 0.2 * (end - start)
         middle = [s for s in self.samples if a <= s.timestamp <= b]
-        if len(middle) < 5:
+        if not self._coverage(middle, a, b):
             return False
         times = [s.timestamp for s in middle]
         if min(times) > a + (b-a)*0.25 or max(times) < b - (b-a)*0.25:
