@@ -269,6 +269,7 @@ class FilamentForce:
             config.getint("event_max_points", 512, minval=16, maxval=2048),
         )
         self._incident_id: str | None = None
+        self._incident_filename = ""
         self._recovery_total = 0
         self._stable_since: float | None = None
         self._stable_last: float | None = None
@@ -741,6 +742,7 @@ class FilamentForce:
         self._diag_generation += 1
         self._recovery = Recovery()
         self._incident_id = None
+        self._incident_filename = ""
         self._recovery_total = 0
         self._reset_stability()
         if hasattr(self, "_event_journal"):
@@ -877,6 +879,8 @@ class FilamentForce:
         self._last_e_pos = None
         self._last_e_time = None
         self._window.reset()
+        if hasattr(self, "_event_journal"):
+            self._event_journal.clear_trace()
         self._unlock_baseline()
         self._last_force = 0.0
         self._e_idle_since = None
@@ -910,6 +914,7 @@ class FilamentForce:
         self._live_e_at = None
 
     def _disarm(self) -> None:
+        self._reset_stability()
         self._armed = False
         self._test_runout = False
         if self._poll_timer is not None:
@@ -1843,8 +1848,10 @@ class FilamentForce:
     def _verify_recovery_window(self, book: force_signal.ToolForceBook,
                                 bin_i: int, force: float) -> None:
         ref = self._force_reference(book, bin_i)
-        if ref is None:
-            return  # no healthy evidence; independent timeout remains active
+        key = self.active_tool if self.active_tool >= 0 else -1
+        if ref is None or (key, bin_i) in self._restored_bins or (key, -1) in self._restored_bins:
+            self._recovery.healthy = 0
+            return  # no trusted healthy evidence; independent timeout remains active
         band = ref.score(force)
         if book.runout.learned:
             run = book.runout.mean_stdev()
@@ -2050,6 +2057,7 @@ class FilamentForce:
                 stats_obj = self.printer.lookup_object("print_stats", None)
                 filename = stats_obj.get_status(self.reactor.monotonic()).get("filename", "") if stats_obj is not None else ""
                 self._incident_id = None
+                self._incident_filename = str(filename or "")
                 event = self._publish_event(
                     "jam_detected" if kind is TripKind.JAM else "runout_detected",
                     source=source, force_g=force_g, layer=self._incident_layer,
@@ -2110,6 +2118,7 @@ class FilamentForce:
         if not getattr(self, "event_enabled", False):
             return None
         try:
+            fields.setdefault("filename", self._incident_filename)
             event = self._event_journal.emit(
                 kind, host_monotonic_s=self.reactor.monotonic(),
                 incident_id=self._incident_id, **fields)
@@ -2452,6 +2461,9 @@ class FilamentForce:
             raise gcmd.error("filament_force: diagnosis still running")
         tool = gcmd.get_int("TOOL")
         self.active_tool = tool
+        self._reset_stability()
+        if hasattr(self, "_event_journal"):
+            self._event_journal.clear_trace()
         self._window.reset()
         self._unlock_baseline()
         self._unretract_remaining = 0.0
@@ -2480,6 +2492,9 @@ class FilamentForce:
         self._diag_generation += 1
         self._recovery.state = RecoveryState.MONITORING
         self._recovery.clearance = False
+        self._reset_stability()
+        if hasattr(self, "_event_journal"):
+            self._event_journal.clear_trace()
         tool = gcmd.get_int("TOOL", self.active_tool)
         book = self._book_for(tool)
         book.reset()
@@ -2518,6 +2533,7 @@ class FilamentForce:
         self._diag_generation += 1
         self._recovery.state = RecoveryState.MONITORING
         self._recovery.clearance = False
+        self._reset_stability()
         if not self.actions.pending_recheck:
             if self.actions.in_print_job():
                 self.actions.do_resume(velocity)
