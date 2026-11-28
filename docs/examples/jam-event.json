@@ -1,0 +1,64 @@
+{
+  "schema": 1,
+  "boot_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "seq": 12,
+  "event_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:12",
+  "incident_id": null,
+  "kind": "jam_detected",
+  "host_monotonic_s": 1200.5,
+  "filename": "SYNTHETIC.gcode",
+  "source": "hard",
+  "layer": 1,
+  "tool": -1,
+  "force_g": 4200,
+  "e_speed_mm_s": 1,
+  "target_c": 400,
+  "detection_length_mm": 7,
+  "absolute_limit_g": 4000,
+  "window": {
+    "clock": "mcu_print_time",
+    "start_time": 320,
+    "duration_s": 0.25,
+    "sample_count": 4,
+    "returned_count": 4,
+    "downsampled": false,
+    "force_ref_g": 120,
+    "columns": [
+      "t_s",
+      "force_g"
+    ],
+    "samples": [
+      [
+        0,
+        530
+      ],
+      [
+        0.05,
+        4320
+      ],
+      [
+        0.15,
+        4350
+      ],
+      [
+        0.25,
+        4320
+      ]
+    ],
+    "windows": [
+      {
+        "host_monotonic_s": 1199.9,
+        "duration_s": 7,
+        "e_speed_mm_s": 1,
+        "force_g": 410,
+        "bin": 1,
+        "short_bead": false,
+        "mean_g": 400,
+        "stdev_g": 25,
+        "z_score": 0.3125,
+        "anomaly": "none",
+        "learned": true
+      }
+    ]
+  }
+}
