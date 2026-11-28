@@ -318,7 +318,11 @@ class FilamentForce:
         self._baseline_wait_since: float | None = None
         self._watchdog_started: float | None = None
         self._protection_queued = False
+        self._protection_queued_at: float | None = None
+        self._protection_escalated = False
         self._protection_fault = ""
+        self._diagnostic_stop_queued = False
+        self.diagnostic_shutdown_on_limit = config.getboolean("diagnostic_shutdown_on_limit", True)
         self._resume_capture: FreeAirDiagnostic | None = None
         self.min_delta_g: float = config.getfloat("min_delta_g", 15.0, above=0.0)
         self.high_sigma: float = config.getfloat("high_sigma", 4.0, above=0.0)
@@ -757,6 +761,7 @@ class FilamentForce:
         self._save_model_store(checkpoint=True)
         self._diag_generation += 1
         self._watchdog_started = None
+        self._protection_queued_at = None
         self._protection_fault = ""
         self._recovery = Recovery()
         self._incident_id = None
@@ -964,10 +969,13 @@ class FilamentForce:
     def _protection_watchdog(self, eventtime: float) -> float:
         # Independent of E-window completion and the sample callback.
         next_time = eventtime + 0.25
-        if (not self.enabled or not self.actions.is_printing() or self.suppress
-                or self._cal.active or self._spike.active or self._diag.active
-                or self._triggering or self._recovery.state in
-                (RecoveryState.PREPARING, RecoveryState.RESUMING)):
+        if not self.enabled or not self.actions.is_printing():
+            self._watchdog_started = None
+            return next_time
+        # Live printing must not be exempt merely because a recovery macro
+        # is still running. Explicit toolchange suppression is retained only
+        # outside a fault/recovery transaction.
+        if self.suppress and self._recovery.state is RecoveryState.MONITORING:
             self._watchdog_started = None
             return next_time
         if self._jam_action_paused():
@@ -987,16 +995,27 @@ class FilamentForce:
             reason = "force baseline unavailable"
         if reason and not self._protection_queued:
             self._protection_queued = True
+            self._protection_queued_at = eventtime
+            self._protection_escalated = False
             generation = self._diag_generation
             self.reactor.register_callback(
                 lambda _t: self._stop_unprotected(generation, reason))
+        elif (self._protection_queued and self._protection_queued_at is not None
+              and eventtime - self._protection_queued_at >= self.sensor_timeout_s
+              and not self._protection_escalated):
+            # PAUSE may be waiting for the G-code mutex held by RESUME.
+            # Escalate without acquiring that mutex if printing continues.
+            self._protection_escalated = True
+            cast(Any, self.printer).invoke_shutdown(
+                "filament_force: protection pause deadline exceeded")
         return next_time
 
     def _stop_unprotected(self, generation: int, reason: str) -> None:
         try:
             with self.gcode.get_mutex():
                 if (generation != self._diag_generation or not self.actions.is_printing()
-                        or self._jam_action_paused() or not self.enabled or self.suppress):
+                        or self._jam_action_paused() or not self.enabled
+                        or (self.suppress and self._recovery.state is RecoveryState.MONITORING)):
                     return
                 self._protection_fault = reason
                 self._diag_generation += 1
@@ -1031,6 +1050,23 @@ class FilamentForce:
                 self._ensure_fault_pause(reason)
         finally:
             self._protection_queued = False
+            self._protection_queued_at = None
+
+    def _queue_diagnostic_shutdown(self, diagnostic: FreeAirDiagnostic) -> None:
+        # A host shutdown request is stronger than PAUSE, but is not a
+        # guaranteed instantaneous MCU/drive interlock.
+        if not self.diagnostic_shutdown_on_limit or self._diagnostic_stop_queued:
+            return
+        self._diagnostic_stop_queued = True
+        generation = self._diag_generation
+        def stop(_eventtime: float) -> None:
+            try:
+                if generation == self._diag_generation and diagnostic.limit_hit:
+                    cast(Any, self.printer).invoke_shutdown(
+                        "filament_force: diagnostic force limit exceeded")
+            finally:
+                self._diagnostic_stop_queued = False
+        self.reactor.register_callback(stop)
 
     def _force_client(self, msg: object) -> bool:
         now = self.reactor.monotonic()
@@ -1040,10 +1076,14 @@ class FilamentForce:
         if capture is not None:
             for sample in samples:
                 capture.note(sample)
+            if capture.limit_hit:
+                self._queue_diagnostic_shutdown(capture)
             return True
         if self._diag.active:
             for sample in samples:
                 self._diag.note(sample)
+            if self._diag.limit_hit:
+                self._queue_diagnostic_shutdown(self._diag)
             return True
         in_probe = self._spike.active or self._cal.active
         if not self._armed and not in_probe:

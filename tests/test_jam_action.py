@@ -64,6 +64,10 @@ def monitor(
     result._triggering = result._test_runout = result.suppress = False
     result._armed = True
     result._diag_generation = 0
+    result._protection_queued_at = None
+    result._protection_escalated = False
+    result._diagnostic_stop_queued = False
+    result.diagnostic_shutdown_on_limit = True
     result._recovery = Recovery()
     result._z_ownership = ZOwnership()
     result._last_e_speed = 1.5
@@ -360,7 +364,6 @@ def test_d_fault_observer_exception_does_not_prevent_fault_pause(
     assert monitor._event_journal.status()[0]["reason"] == "injected"
 
 
-@pytest.mark.xfail(strict=True, reason="D-F01: RESUMING suppresses watchdog even after actual print starts")
 def test_d_fault_resume_macro_continues_print_after_sensor_stops(monitor: FilamentForce) -> None:
     monitor.enabled = True
     monitor._sample_health = SampleHealth(last_mcu=1.0, last_host=0.0)
@@ -377,7 +380,6 @@ def test_d_fault_resume_macro_continues_print_after_sensor_stops(monitor: Filame
     assert cast(Mock, monitor.reactor).register_callback.called
 
 
-@pytest.mark.xfail(strict=True, reason="D-F02: event listeners receive mutable journal objects")
 def test_d_fault_native_listener_cannot_mutate_retained_event(
     monitor: FilamentForce,
 ) -> None:
@@ -396,3 +398,30 @@ def test_d_fault_native_listener_cannot_mutate_retained_event(
     monitor._publish_event("recovery_failed", reason="injected")
     cast(Mock, monitor.reactor).register_callback.call_args.args[0](3.0)
     assert monitor._event_journal.status()[0]["kind"] == "recovery_failed"
+
+
+def test_protection_escalates_if_pause_callback_cannot_acquire_mutex(monitor: FilamentForce) -> None:
+    monitor.enabled = True
+    monitor._sample_health = SampleHealth(last_mcu=1.0, last_host=0.0)
+    monitor.sensor_timeout_s = 2.0
+    monitor._watchdog_started = 0.0
+    monitor._protection_queued = False
+    monitor._force_ref_locked = True
+    monitor._baseline_wait_since = None
+    monitor._recovery.state = RecoveryState.RESUMING
+    monitor._protection_watchdog(3.0)
+    monitor._protection_watchdog(4.9)
+    cast(Mock, monitor.printer).invoke_shutdown.assert_not_called()
+    monitor._protection_watchdog(5.0)
+    monitor._protection_watchdog(6.0)
+    cast(Mock, monitor.printer).invoke_shutdown.assert_called_once()
+
+
+def test_diagnostic_shutdown_is_latched_and_mutex_free(monitor: FilamentForce) -> None:
+    d = FreeAirDiagnostic(limit_hit=True)
+    monitor._queue_diagnostic_shutdown(d)
+    monitor._queue_diagnostic_shutdown(d)
+    reactor = cast(Mock, monitor.reactor)
+    reactor.register_callback.assert_called_once()
+    reactor.register_callback.call_args.args[0](1.0)
+    cast(Mock, monitor.printer).invoke_shutdown.assert_called_once()

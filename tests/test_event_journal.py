@@ -34,3 +34,14 @@ def test_timestamp_regression_clears_trace_not_events():
     j.note(Sample(1, 2))
     assert j.trace(None)["samples"] == [[0, 2]]
     assert len(j.status()) == 1
+
+
+def test_event_snapshot_isolated_at_all_public_boundaries() -> None:
+    journal = EventJournal()
+    payload = {"samples": [[0, 100]]}
+    emitted = journal.emit("jam_detected", window=payload)
+    payload["samples"][0][1] = 999
+    emitted["window"]["samples"][0][1] = 888
+    status = journal.status()
+    status[0]["window"]["samples"][0][1] = 777
+    assert journal.status()[0]["window"]["samples"][0][1] == 100

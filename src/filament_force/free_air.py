@@ -95,7 +95,10 @@ class FreeAirDiagnostic:
         # Peak interlock also includes onset and trailing samples.
         a = start + 0.2 * (end - start)
         b = end - 0.2 * (end - start)
-        middle = [s for s in self.samples if a <= s.timestamp <= b]
+        full = [s for s in self.samples if start <= s.timestamp <= end]
+        if not self._coverage(full, start, end):
+            return False
+        middle = [s for s in full if a <= s.timestamp <= b]
         if not self._coverage(middle, a, b):
             return False
         times = [s.timestamp for s in middle]
