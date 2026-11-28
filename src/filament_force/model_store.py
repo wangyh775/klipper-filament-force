@@ -27,6 +27,7 @@ class ModelLoadResult:
     state: str
     books: dict[int, ToolForceBook]
     reason: str = ""
+    saved_at: str | None = None
 
 
 def _samples(value: object, limit: int) -> list[float]:
@@ -107,7 +108,15 @@ def decode(
             result[tool] = book
     except (ValueError, TypeError, OverflowError) as exc:
         return ModelLoadResult("invalid", {}, str(exc))
-    return ModelLoadResult("loaded", result)
+    saved_at = data.get("saved_at")
+    if isinstance(saved_at, str):
+        try:
+            saved_at = datetime.fromisoformat(saved_at).isoformat()
+        except ValueError:
+            saved_at = None
+    else:
+        saved_at = None
+    return ModelLoadResult("loaded", result, saved_at=saved_at)
 
 
 class ModelStore:
@@ -116,7 +125,7 @@ class ModelStore:
         if profile != "default":
             key = hashlib.sha256(profile.encode("utf-8")).hexdigest()[:24]
             path = path.with_name(f"{path.stem}.{key}{path.suffix}")
-        self.path = path
+        self.path = path.absolute()
 
     def load(
         self,

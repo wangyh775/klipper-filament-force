@@ -97,9 +97,29 @@ separate hashed filenames alongside model_file. Earlier files with the
 incomplete sampling fingerprint are intentionally incompatible; supervise
 the first learning print after upgrading.
 
-Use `FILAMENT_FORCE_QUERY` to inspect `model_persistence`,
-`model_state`, and `pending_validation`. Set `model_persistence: False` in
-the config and restart to disable persistence. `FILAMENT_FORCE_RESET
+Run `FILAMENT_FORCE_QUERY` in the Mainsail or Fluidd console to see:
+
+- `enabled`, `armed`, and `suppress` for configured enablement, whether
+  the detector is armed, and whether monitoring is temporarily suppressed.
+  The sensor and `sigma_jam` status and the absolute-force limit are also shown.
+  The detector can be enabled but unarmed while idle. During motion, force
+  scoring still requires the relevant tare, extrusion, and model conditions.
+- `learned` and the window count for each extruder speed bin and the runout
+  reference. Only the speed bins used in a print accumulate windows.
+- `model_state` and `pending_validation` for the startup load result and
+  the number of restored references awaiting validation.
+- `model_save` and `saved_at` for the latest disk checkpoint, including
+  `pending` and `failed` states. The timestamp is UTC. `model_file`
+  is the absolute path for the active profile, including any profile suffix.
+  `model_save_error` shows the latest write failure while it is unresolved.
+
+The console also reports startup state, newly learned references, successful
+checkpoints, and save failures. Routine periodic saves update query status
+without repeating console messages. `quiet: True` suppresses routine notices;
+save failures are still reported. Moonraker exposes the same persistence
+information on the `filament_force` printer object.
+
+Set `model_persistence: False` in the config and restart to disable persistence. `FILAMENT_FORCE_RESET
 [TOOL=n]` clears that tool's learned history and queues an immediate durable
 snapshot, acknowledging success only after the write finishes. A write
 failure or timeout is reported; do not assume reset survived power loss.

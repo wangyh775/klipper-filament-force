@@ -317,7 +317,11 @@ class FilamentForce:
         self.model_store = ModelStore(self.model_file, profile=self.model_profile)
         self._model_writer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ff-model")
         self._model_future: Future[None] | None = None
-        self._model_timer: Any | None = None
+        self._model_result_timer: Any | None = None
+        self._model_snapshot_at: str | None = None
+        self._model_saved_at: str | None = None
+        self._model_save_error: str | None = None
+        self._model_save_checkpoint = False
         self._model_dirty = False
         self._restored_bins: dict[tuple[int, int], int] = {}
         self._model_load_state = "disabled"
@@ -527,6 +531,7 @@ class FilamentForce:
             min_learn_windows=self.min_learn_windows,
         )
         self._model_load_state = result.state
+        self._model_saved_at = result.saved_at
         if result.state == "loaded":
             self.books = result.books
             for tool, book in self.books.items():
@@ -549,7 +554,45 @@ class FilamentForce:
                 result.state, result.reason,
             )
 
-    def _collect_model_save(self, *, wait: bool = False) -> bool:
+    def _model_save_status(self) -> str:
+        if not self.model_persistence:
+            return "disabled"
+        if self._model_future is not None:
+            return "pending"
+        if self._model_save_error is not None:
+            return "failed"
+        if self._model_saved_at is not None or self._model_load_state == "loaded":
+            return "saved"
+        return "not_saved"
+
+    def _model_summary(self) -> str:
+        return (
+            f"model_profile={self.model_profile} model_save={self._model_save_status()}"
+            f" saved_at={self._model_saved_at or '-'}"
+            f" pending_validation={len(self._restored_bins)}"
+            f"\nmodel_file={self.model_store.path}"
+        )
+
+    def _detection_summary(self) -> str:
+        return (
+            f"enabled={'on' if self.enabled else 'off'}"
+            f" armed={'yes' if self._armed else 'no'}"
+            f" suppress={'yes' if self.suppress else 'no'}"
+            f" sensor={self.sensor_name}:{'ready' if self._load_cell is not None else 'unavailable'}"
+            f" sigma_jam={'on' if self.sigma_jam else 'off'}"
+            f" oh_shit_force={self.oh_shit_force:.1f}g"
+        )
+
+    def _record_model_save_error(self, exc: Exception, *, notify: bool = True) -> None:
+        self._model_dirty = True
+        error = str(exc) or type(exc).__name__
+        if notify and error != self._model_save_error:
+            self.gcode.respond_info(
+                f"filament_force: model save failed; file={self.model_store.path}; {error}"
+            )
+        self._model_save_error = error
+
+    def _collect_model_save(self, *, wait: bool = False, notify: bool = True) -> bool:
         future = self._model_future
         if future is None:
             return True
@@ -558,10 +601,34 @@ class FilamentForce:
         self._model_future = None
         try:
             future.result()
-        except Exception:
-            self._model_dirty = True
+        except Exception as exc:
+            self._record_model_save_error(exc, notify=notify)
             logging.exception("filament_force model_store save failed")
+        else:
+            announce = (
+                self._model_save_checkpoint or self._model_saved_at is None
+                or self._model_save_error is not None
+            )
+            self._model_saved_at = self._model_snapshot_at
+            self._model_save_error = None
+            if announce and notify and not self.quiet:
+                self.gcode.respond_info(
+                    f"filament_force: model saved; file={self.model_store.path}"
+                    f"; saved_at={self._model_saved_at}"
+                )
         return True
+
+    def _queue_model_save(self, *, checkpoint: bool) -> Future[None]:
+        # Snapshot on reactor; only the worker owns the detached payload.
+        payload = snapshot(self.books, self._model_fingerprint())
+        future = self._model_writer.submit(self.model_store.save_payload, payload)
+        self._model_future = future
+        self._model_snapshot_at = str(payload["saved_at"])
+        self._model_save_checkpoint = checkpoint
+        self._model_dirty = False
+        if self._model_result_timer is not None:
+            self.reactor.update_timer(self._model_result_timer, self.reactor.NOW)
+        return future
 
     def _save_model_store(self, *, checkpoint: bool = False) -> None:
         if not self.model_persistence:
@@ -571,18 +638,19 @@ class FilamentForce:
         if not self._model_dirty:
             return
         try:
-            # Snapshot on reactor; only the worker owns the detached payload.
-            payload = snapshot(self.books, self._model_fingerprint())
-            self._model_future = self._model_writer.submit(
-                self.model_store.save_payload, payload
-            )
-            self._model_dirty = False
-        except Exception:
+            self._queue_model_save(checkpoint=checkpoint)
+        except Exception as exc:
+            self._record_model_save_error(exc, notify=self._model_result_timer is not None)
             logging.exception("filament_force model_store snapshot failed")
 
     def _model_save_event(self, eventtime: float) -> float:
         self._save_model_store()
         return eventtime + self.model_save_interval
+
+    def _model_result_event(self, eventtime: float) -> float:
+        if self._collect_model_save():
+            return self.reactor.NEVER
+        return eventtime + 0.2
 
     def _rebuild_books(self) -> None:
         self.books = {}
@@ -598,19 +666,19 @@ class FilamentForce:
             return
         # Klipper sends disconnect after the reactor has stopped and before
         # the next instance loads its model. Drain the old writer first.
-        self._collect_model_save(wait=True)
+        self._model_result_timer = None
+        self._collect_model_save(wait=True, notify=False)
         self._save_model_store()
         self._model_writer.shutdown(wait=True)
-        self._collect_model_save()
+        self._collect_model_save(notify=False)
 
     def _persist_reset(self, gcmd: GCodeCommand) -> None:
         if not self.model_persistence:
             return
+        future = None
         try:
-            payload = snapshot(self.books, self._model_fingerprint())
             # FIFO with any older snapshot: an old save cannot overwrite reset.
-            future = self._model_writer.submit(self.model_store.save_payload, payload)
-            self._model_future = future
+            future = self._queue_model_save(checkpoint=True)
             deadline = self.reactor.monotonic() + 5.0
             while not future.done():
                 now = self.reactor.monotonic()
@@ -618,11 +686,15 @@ class FilamentForce:
                     raise TimeoutError("model reset write still pending")
                 self.reactor.pause(min(now + 0.05, deadline))
             future.result()
-            self._model_future = None
         except Exception as exc:
             self._model_dirty = True
+            if future is None:
+                self._record_model_save_error(exc, notify=False)
             logging.exception("filament_force model reset persistence failed")
             raise gcmd.error(f"filament_force: reset not confirmed on disk: {exc}")
+        finally:
+            if future is not None and self._model_future is future:
+                self._collect_model_save()
 
     def _handle_job_reset(self, *args: object) -> None:
         """Checkpoint the model and release state owned by the old job."""
@@ -714,13 +786,30 @@ class FilamentForce:
         if mcu is not None:
             self._estimated_print_time = mcu.estimated_print_time
         if self.model_persistence:
-            self._model_timer = self.reactor.register_timer(
+            self.reactor.register_timer(
                 self._model_save_event,
                 self.reactor.monotonic() + self.model_save_interval,
             )
+            self._model_result_timer = self.reactor.register_timer(
+                self._model_result_event, self.reactor.NEVER
+            )
+            if self._model_future is not None:
+                self.reactor.update_timer(self._model_result_timer, self.reactor.NOW)
         self._poll_timer = self.reactor.register_timer(
             self._poll_event, self.reactor.NEVER
         )
+        # Moonraker subscribes to G-code output after Klipper becomes ready.
+        self.reactor.register_callback(
+            self._announce_ready, self.reactor.monotonic() + 2.0
+        )
+
+    def _announce_ready(self, eventtime: float) -> None:
+        del eventtime
+        if not self.quiet or self._load_cell is None:
+            self.gcode.respond_info(
+                f"filament_force: {self._detection_summary()}\n"
+                f"model_state={self._model_load_state} {self._model_summary()}"
+            )
 
     def _handle_printing(self, print_time: float) -> None:
         del print_time
@@ -1047,11 +1136,16 @@ class FilamentForce:
         )
         trip_kind = TripKind.from_anomaly(trip) if trip is not None else None
         self._model_dirty = True
-        if (
-            (hist.learned and not bin_was_learned)
-            or (book.runout.learned and not runout_was_learned)
-        ):
+        learned_references = []
+        if hist.learned and not bin_was_learned:
+            learned_references.append(f"speed_bin={bin_i} ({hist.window_count} windows)")
+        if book.runout.learned and not runout_was_learned:
+            learned_references.append(f"runout ({book.runout.window_count} windows)")
+        if learned_references:
             self._save_model_store(checkpoint=True)
+            if not self.quiet:
+                refs = ", ".join(learned_references)
+                self.gcode.respond_info(f"filament_force: model learned; tool={tool_key} {refs}")
         if trip_kind is None:
             return next_time
         # Trips are rare: always write klippy.log, even if debug_log is off.
@@ -1569,6 +1663,14 @@ class FilamentForce:
             "diagnostic_contact_possible": int(
                 self._diag.result is Diagnosis.FLOW_COMPATIBLE and self._diag_first_layer
             ),
+            "model_persistence": int(self.model_persistence),
+            "model_state": self._model_load_state,
+            "model_file": str(self.model_store.path),
+            "model_profile": self.model_profile,
+            "model_save_state": self._model_save_status(),
+            "model_saved_at": self._model_saved_at,
+            "model_save_error": self._model_save_error,
+            "sensor_ready": int(self._load_cell is not None),
             "model_pending_validation": len(self._restored_bins),
             "model_uncertain": sum(v < 0 for v in self._restored_bins.values()),
             "first_layer_z_enabled": int(self.first_layer.enabled),
@@ -1748,7 +1850,7 @@ class FilamentForce:
         )
 
     cmd_FILAMENT_FORCE_QUERY_help = (
-        "Report per-tool filament force bands and suspect state"
+        "Report detection state, per-tool force bands and model persistence"
     )
 
     def cmd_FILAMENT_FORCE_QUERY(self, gcmd: GCodeCommand) -> None:
@@ -1793,12 +1895,10 @@ class FilamentForce:
             f" total={self.first_layer.applied_mm:.3f}mm\n"
             f"  model_persistence={'on' if self.model_persistence else 'off'}"
             f" model_state={self._model_load_state}"
-            f" pending_validation={len(self._restored_bins)}"
             f" uncertain={sum(v < 0 for v in self._restored_bins.values())}\n"
-            f"  enabled={'on' if self.enabled else 'off'}"
-            f" armed={'yes' if self._armed else 'no'}"
-            f" suppress={'yes' if self.suppress else 'no'}"
-            f" sigma_jam={'on' if self.sigma_jam else 'off'}\n"
+            f"  {self._model_summary()}\n"
+            f"  model_save_error={self._model_save_error or '-'}\n"
+            f"  {self._detection_summary()}\n"
             f"  tool={tool} last_bin={self._last_bin}"
             f" learned={learned}"
             f" windows={hist.window_count}/{self.min_learn_windows}\n"
