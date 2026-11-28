@@ -357,7 +357,7 @@ after 60 s of healthy observed printing by default; total attempts are separate.
 - [Architecture](docs/ARCHITECTURE.md)
 - [Algorithm](docs/ALGORITHM.md)
 - [Diagnosis & recovery](docs/RECOVERY.md)
-- [Event protocol](docs/EVENTS.md)
+- [Event protocol](docs/events.md)
 - [Troubleshooting](docs/TROUBLESHOOTING.md)
 - [Testing](docs/TESTING.md)
 

@@ -12,4 +12,4 @@ The package runs inside Klippy, not as an independent daemon. Load-cell data and
 ![Fig. 2. File responsibilities, not a Python import graph.](media/en/02-modules.svg)
 
 *Fig. 2. File responsibilities, not a Python import graph.*
-The main orchestrator owns arming, job generation, sensor callbacks, polling, G-code integration and status. Pure helpers encapsulate scoring, diagnosis, recovery and event buffering. Model snapshots use a single disk worker; sampling does not perform network or disk I/O. Stale generation callbacks must not act on a new job. See [recovery](RECOVERY.md) and [events](EVENTS.md).
+The main orchestrator owns arming, job generation, sensor callbacks, polling, G-code integration and status. Pure helpers encapsulate scoring, diagnosis, recovery and event buffering. Model snapshots use a single disk worker; sampling does not perform network or disk I/O. Stale generation callbacks must not act on a new job. See [recovery](RECOVERY.md) and [events](events.md).

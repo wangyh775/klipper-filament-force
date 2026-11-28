@@ -155,7 +155,7 @@ uv run ty check src tests
 - [系统架构](docs/ARCHITECTURE.zh-CN.md)
 - [检测算法](docs/ALGORITHM.zh-CN.md)
 - [诊断与恢复](docs/RECOVERY.zh-CN.md)
-- [事件协议](docs/EVENTS.zh-CN.md)
+- [事件协议](docs/events.zh-CN.md)
 - [故障排查](docs/TROUBLESHOOTING.zh-CN.md)
 - [测试与验收](docs/TESTING.zh-CN.md)
 
