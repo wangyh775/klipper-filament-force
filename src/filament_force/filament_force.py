@@ -317,6 +317,7 @@ class FilamentForce:
         self._watchdog_started: float | None = None
         self._protection_queued = False
         self._protection_fault = ""
+        self._resume_capture: FreeAirDiagnostic | None = None
         self.min_delta_g: float = config.getfloat("min_delta_g", 15.0, above=0.0)
         self.high_sigma: float = config.getfloat("high_sigma", 4.0, above=0.0)
         self.sigma_jam: bool = config.getboolean("sigma_jam", True)
@@ -558,6 +559,7 @@ class FilamentForce:
             "min_e_speed": self.min_e_speed,
             "rolling_window": self.rolling_window,
             "baseline_time": self.baseline_time,
+            "baseline_max_span_g": self.baseline_max_span_g,
             "idle_reset_s": self.idle_reset_s,
             "min_learn_s": self.min_learn_s,
             "poll_interval": self.poll_interval,
@@ -892,7 +894,10 @@ class FilamentForce:
         self._window.reset()
         if hasattr(self, "_event_journal"):
             self._event_journal.clear_trace()
-        self._unlock_baseline()
+        # A prequalified baseline belongs to this automatic recovery only.
+        if not (self._recovery.state in (RecoveryState.RESUMING, RecoveryState.VERIFYING)
+                and self._force_ref_locked):
+            self._unlock_baseline()
         self._last_force = 0.0
         self._e_idle_since = None
         self._last_idle_s = 0.0
@@ -982,6 +987,11 @@ class FilamentForce:
         now = self.reactor.monotonic()
         samples = force_signal.iter_load_cell_samples(msg)
         fresh = [sample for sample in samples if self._sample_health.note(sample.timestamp, now)]
+        capture = self._resume_capture
+        if capture is not None:
+            for sample in samples:
+                capture.note(sample)
+            return True
         if self._diag.active:
             for sample in samples:
                 self._diag.note(sample)
@@ -1086,6 +1096,7 @@ class FilamentForce:
             or self._spike.active
             or self._cal.active
             or self._diag.active
+            or self._recovery.state is RecoveryState.RESUMING
             or self.actions.pending_recheck
         ):
             return next_time
@@ -1755,6 +1766,41 @@ class FilamentForce:
             self._recovery.fail(d.result.value)
             self._publish_event("recovery_failed", reason=d.result.value)
 
+    def _qualify_resume_baseline(self, generation: int) -> float:
+        """Collect fresh stationary force after recovery preparation, before RESUME."""
+        clock = self._estimated_print_time
+        reference = self._diag.reference
+        if clock is None or reference is None or not math.isfinite(reference):
+            raise RuntimeError("diagnostic baseline unavailable")
+        if not self._diagnostic_ready(generation):
+            raise RuntimeError("resume context changed")
+        self.gcode.run_script_from_command("M400")
+        toolhead = self.printer.lookup_object("toolhead")
+        queued = toolhead.get_last_move_time()
+        now = self.reactor.monotonic()
+        e_start = self._extruder_pos(now)
+        start = clock(now)
+        capture = FreeAirDiagnostic(max_sample_gap_s=self.diagnostic_max_sample_gap_s)
+        capture.begin(min(self.diagnostic_limit, self.oh_shit_force))
+        capture.reference = reference
+        capture.capture(start)
+        self._resume_capture = capture
+        try:
+            end = start + 0.8
+            self.reactor.pause(now + 0.8 + 0.25)  # allow buffered sample delivery
+            if (not self._diagnostic_ready(generation)
+                    or toolhead.get_last_move_time() != queued
+                    or e_start is None or self._extruder_pos(self.reactor.monotonic()) != e_start):
+                raise RuntimeError("motion or context changed during baseline qualification")
+            if capture.limit_hit or not capture.set_reference(start, end, self.baseline_max_span_g):
+                raise RuntimeError("unstable or missing pre-resume force baseline")
+            baseline = capture.reference
+            if baseline is None or abs(baseline - reference) > self.baseline_max_span_g:
+                raise RuntimeError("pre-resume baseline differs from diagnosis")
+            return baseline
+        finally:
+            self._resume_capture = None
+
     def _resume_after_diagnosis(self, generation: int) -> None:
         ctl = self.first_layer
         recovery = self._recovery
@@ -1832,6 +1878,7 @@ class FilamentForce:
             })
             if not self._diagnostic_ready(generation):
                 raise RuntimeError("resume preparation changed diagnostic context")
+            baseline = self._qualify_resume_baseline(generation)
             if updated is not None:
                 if not isinstance(states, dict) or states.get("PAUSE_STATE") is not old_state:
                     raise RuntimeError("pause state changed during resume preparation")
@@ -1839,10 +1886,14 @@ class FilamentForce:
             book.clear_streaks()
             self._window.reset()
             self._unlock_baseline()
+            self._force_ref = baseline
+            self._force_ref_locked = True
             self._unretract_remaining = 0.0
             self._last_e_pos = self._last_e_time = None
             self._after_idle = True
-            # Clear only immediately before the qualified underlying resume.
+            # Arm against the qualified reference before underlying resume.
+            self._arm()
+            self._seen_forward_e = True
             self.actions.clear_pending()
             self.actions.do_resume(None)
             if generation != self._diag_generation:
@@ -1855,6 +1906,10 @@ class FilamentForce:
                     raise RuntimeError("resume did not restore corrected Z offset")
                 ctl.record_adjustment(self.reactor.monotonic())
                 self._recovery_z_origin = actual
+            # Discard resume-macro motion from statistical windows, not the
+            # qualified tare or hard-force dwell.
+            self._window.reset()
+            self._last_e_pos = self._last_e_time = None
             recovery.start_verification(self.reactor.monotonic(), self.recovery_verify_timeout)
             if step:
                 self._publish_event("z_adjusted", step_mm=step, total_mm=ctl.applied_mm)
@@ -1879,6 +1934,7 @@ class FilamentForce:
 
     def _pause_recovery(self, reason: str, tool: int, target: float) -> None:
         self._recovery.fail(reason)
+        self._unlock_baseline()
         self._reset_stability()
         self._publish_event("recovery_failed", reason=reason)
         self.actions.set_pending(tool=tool, target=target, reason="jam")
