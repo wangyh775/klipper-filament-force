@@ -283,7 +283,8 @@ class FilamentForce:
         self._incident_recoverable = False
         self._live_e_speed = 0.0
         self._live_e_at: float | None = None
-        self._z_ownership = ZOwnership()
+        self._z_ownership = ZOwnership.load(config.get(
+            "z_ownership_file", "~/printer_data/config/filament_force_z_ownership.json"))
         self.diagnostic_limit = config.getfloat("diagnostic_force_limit", 0.0, minval=0.0)
         self.diagnostic_low = config.getfloat("diagnostic_force_min", 0.0, minval=0.0)
         self.diagnostic_high = config.getfloat("diagnostic_force_max", 0.0, minval=0.0)
@@ -793,6 +794,12 @@ class FilamentForce:
         self._diag_first_layer = False
         self.first_layer.reset()
         if self._z_ownership.finish_job():
+            # The staged/applied record is already durable. Checkpoint the
+            # pending cleanup state; failure leaves a manual-only lockout.
+            try:
+                self._z_ownership.checkpoint()
+            except Exception:
+                logging.exception("filament_force cannot checkpoint Z cleanup")
             generation = self._diag_generation
             self.reactor.register_callback(lambda _t: self._undo_recovery_z(generation))
 
@@ -833,7 +840,10 @@ class FilamentForce:
         self.gcode.run_script_from_command("M400")
         if self.actions.in_print_job() or self._current_z_origin() is None:
             raise gcmd.error("filament_force: cannot confirm idle coordinate state")
-        self._z_ownership.clear()
+        try:
+            self._z_ownership.clear()
+        except Exception as exc:
+            raise gcmd.error(f"filament_force: Z acknowledgement persistence failed: {exc}")
         gcmd.respond_info("filament_force: manual Z reconciliation acknowledged; no offset applied")
 
     def _current_z_origin(self) -> float | None:

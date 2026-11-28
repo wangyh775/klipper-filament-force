@@ -7,3 +7,7 @@ D-F01：实际打印时不因恢复状态豁免看门狗；暂停回调若在 se
 Window quality: reject buffered samples outside MCU print-time age 1 s or >0.1 s in the future; reset hard dwell on gaps >0.05 s. Normal windows require ≥5 samples, bounded gap and sufficient observed span (poll period + age tolerance); invalid windows freeze learning/verification and repeated invalid windows request protection pause. This is conservative coverage gating, not exact motion-synchronized integration. New quality parameters enter the model fingerprint.
 
 窗口质量：使用 MCU print-time 判断积压数据（默认 1 s）及超前时间（0.1 s），间隔超 0.05 s 重置硬力持续计时。普通窗口最少 5 点、限制最大间隔及观测时长（允许轮询与数据年龄误差）；不合格冻结学习及验证，连续不合格触发保护暂停。此为保守覆盖门控，非严格运动同步积分。新质量参数纳入模型指纹。
+
+Z ledger: stage, commit, rollback and verified clear checkpoint atomically with fsync. Default z_ownership_file is independent of material profile. Any unfinished or malformed record from an earlier process sets manual-only cleanup_pending/uncertain. Never undo across restarts. Disk failure locks out further recovery; verify coordinates at idle then FILAMENT_FORCE_Z_ACK CONFIRM=1. Writes happen on correction/cleanup boundaries, not the ADC callback; filesystem latency must be qualified.
+
+Z 事务：暂存、提交、回滚及确认清除采用原子写入和 fsync，文件独立于材料模型。旧进程未完成记录或损坏文件进入人工确认状态，禁止跨重启自动撤销。写盘故障锁定恢复；空闲核对坐标后使用 FILAMENT_FORCE_Z_ACK CONFIRM=1。写盘发生于补偿/撤销边界，不在 ADC 回调中，需验证存储延迟。

@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 
 from filament_force.z_ownership import ZOwnership
@@ -58,3 +60,35 @@ def test_changed_origin_cannot_be_corrected_or_undone() -> None:
     with pytest.raises(ValueError):
         z.cleanup_target(.2)
     assert z.applied_mm == .02
+
+
+def test_restart_staged_or_applied_requires_manual_reconciliation(tmp_path: Path) -> None:
+    path = str(tmp_path / "z.json")
+    z = ZOwnership.load(path)
+    z.stage(.1, .12, .02)
+    interrupted = ZOwnership.load(path)
+    assert interrupted.cleanup_pending and interrupted.uncertain
+    with pytest.raises(ValueError):
+        interrupted.cleanup_target(.12)
+    z.commit(.12)
+    restarted = ZOwnership.load(path)
+    assert restarted.applied_mm == .02 and restarted.cleanup_pending
+    restarted.clear()
+    assert not ZOwnership.load(path).cleanup_pending
+
+
+def test_corrupt_z_record_fails_closed(tmp_path: Path) -> None:
+    path = tmp_path / "z.json"
+    path.write_text("invalid", encoding="utf-8")
+    z = ZOwnership.load(str(path))
+    assert z.uncertain and z.cleanup_pending
+    assert path.read_text(encoding="utf-8") == "invalid"
+
+
+def test_stage_write_failure_does_not_authorize_motion(tmp_path: Path) -> None:
+    directory = tmp_path / "file"
+    directory.write_text("not a directory", encoding="utf-8")
+    z = ZOwnership.load(str(directory / "z.json"))
+    assert z.cleanup_pending
+    with pytest.raises(ValueError):
+        z.stage(.1, .12, .02)
