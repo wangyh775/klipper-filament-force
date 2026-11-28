@@ -93,7 +93,7 @@ first_layer_verify_windows: 2
 first_layer_min_improvement: 0.15
 ```
 
-诊断速度默认固定 3 mm/s（E 轴耗材进给，范围 0.5–6 mm/s），可通过 CFG 修改。可选匹配模式以该配置速度为上限。脉冲最短持续时间 0.5 s，实际长度为 max(配置最小长度, 速度×0.5 s)，最大 3 mm；默认实际 1.5 mm/次，三次合计 4.5 mm。高温 PEEK 的允许流量及安全载荷必须实测。诊断受力优先复用对应速度组打印模型，人工上下限仅为备用；诊断数据不训练模型。速度相差超过 20% 或不同组仍禁止自动恢复；低速首层可考虑可选速度匹配。正常受力不保证实际出料；力超限终止后续脉冲，不会即时撤销已排队运动。
+诊断速度默认固定 3 mm/s（E 轴耗材进给，范围 0.5–6 mm/s），可通过 CFG 修改。可选匹配模式以该配置速度为上限。脉冲最短持续时间 0.5 s，实际长度为 max(配置最小长度, 速度×0.5 s)，最大 3 mm；默认实际 1.5 mm/次，三次合计 4.5 mm。高温 PEEK 的允许流量及安全载荷必须实测。诊断受力优先复用对应速度组打印模型，人工上下限仅为备用；诊断数据不训练模型。诊断速度不低于故障速度时，两个速度组模型均可信即可跨组评估恢复；诊断速度较低时仅允许同组且偏差不超过 20%。仍需实机验证。正常受力不保证实际出料；力超限终止后续脉冲，不会即时撤销已排队运动。
 
 人工确认喷嘴安全浮空后执行 FILAMENT_FORCE_DIAGNOSE CLEARANCE=1。自动诊断仅在经过验证的准备宏执行 M400 后显式调用 FILAMENT_FORCE_DIAG_READY CLEARANCE=1 时授权，默认宏不移动、不授权。人工命令默认只诊断；RECOVER=1 才请求恢复。
 
@@ -139,3 +139,7 @@ uv run ty check src tests
 [中文设计文档](docs/diagnostic-recovery.zh-CN.md) | [English design](docs/diagnostic-recovery.md) | [示例配置](filament_force.cfg)
 
 自动诊断、恢复和 Z 补偿默认关闭，须完成 CI 和实机安全验证才启用。
+
+## 原生事件与远程监控
+
+参见 [事件协议（中英文）](docs/events.md)。原生 Klippy 事件 filament_force:<kind> 与状态对象 filament_force.events 同时提供，堵头事件包含故障前受力轨迹、窗口统计与唯一 ID。默认保留 30 秒轨迹、最多 512 个保峰降采样点及最近 16 个事件；非完整原始 ADC 数据。Monitor 可经 Moonraker 订阅并将事件及 JSON 数据写入 SQLite、转发 Hermes。连续健康打印默认 60 秒后重置连续恢复次数，单任务累计次数独立记录。
