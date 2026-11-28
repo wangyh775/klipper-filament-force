@@ -13,6 +13,7 @@ from filament_force.first_layer import FirstLayerZControl
 from filament_force.force_signal import ToolForceBook
 from filament_force.free_air import FreeAirDiagnostic
 from filament_force.model_store import ModelStore
+from filament_force.recovery import Recovery
 
 
 @pytest.fixture
@@ -50,6 +51,10 @@ def make_monitor(
         monitor.first_layer = FirstLayerZControl()
         monitor._diag = FreeAirDiagnostic()
         monitor._diag_generation = 0
+        monitor._recovery = Recovery()
+        monitor._recovery_z_origin = None
+        monitor._jam_above_since = None
+        monkeypatch.setattr(monitor, "actions", SimpleNamespace(clear_pending=lambda: None), raising=False)
         monkeypatch.setattr(monitor, "_model_fingerprint", lambda: {"profile": "PEEK"})
         return monitor
 

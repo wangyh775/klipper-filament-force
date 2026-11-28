@@ -434,6 +434,7 @@ class ToolForceBook:
         self.jam_healthy_streak = 0
         self.jam_suspect = False
         self.last_high_band: BandResult | None = None
+        self.last_confirmation_time: float | None = None
 
     def reset(self) -> None:
         for hist in self.bins:
@@ -448,6 +449,7 @@ class ToolForceBook:
         self.jam_streak = 0
         self.jam_healthy_streak = 0
         self.jam_suspect = False
+        self.last_confirmation_time = None
         self.runout.anomalous_streak = 0
         self.runout.healthy_streak = 0
         self.runout.suspect = False
@@ -455,6 +457,17 @@ class ToolForceBook:
             hist.anomalous_streak = 0
             hist.healthy_streak = 0
             hist.suspect = False
+
+    def note_confirmation_time(self, eventtime: float, max_gap_s: float) -> bool:
+        """Expire stale evidence without deleting any learned force history."""
+        previous = self.last_confirmation_time
+        expired = previous is not None and (
+            eventtime < previous or eventtime - previous > max_gap_s
+        )
+        if expired:
+            self.clear_streaks()
+        self.last_confirmation_time = eventtime
+        return expired
 
     def bin_hist(self, bin_i: int) -> ToolForceHistory:
         return self.bins[self._clamp_bin(bin_i)]
@@ -598,6 +611,8 @@ def observe_restored(
     drop_ratio: float,
     runout_max_level_g: float,
     trip_high: bool,
+    eventtime: float | None = None,
+    max_gap_s: float = 30.0,
 ) -> AnomalyKind | None:
     """Score restored references without allowing a mismatch to replace them.
 
@@ -608,6 +623,10 @@ def observe_restored(
     """
     if short_bead or not math.isfinite(raw_g) or not math.isfinite(e_speed):
         return None
+    if eventtime is not None and book.note_confirmation_time(eventtime, max_gap_s):
+        for key in pending:
+            if key[0] == tool:
+                pending[key] = 0
     index = speed_bin_index(e_speed, edges)
     hist = book.bin_hist(index)
     bin_key, runout_key = (tool, index), (tool, -1)
