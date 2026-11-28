@@ -1,15 +1,18 @@
 """Regression tests for the optional learned-band jam action."""
 
 from contextlib import nullcontext
+from typing import cast
 from unittest.mock import Mock, call
 
 import pytest
 
-from filament_force.filament_force import FilamentForce
+from filament_force.filament_force import FilamentForce, OhShitCal
 from filament_force.first_layer import FirstLayerZControl
+from filament_force.free_air import FreeAirDiagnostic
 from filament_force.force_signal import EWindowAccumulator, TripKind
 from filament_force.pause import MonitorActions, MonitorTemplate
 from filament_force.recovery import Recovery, RecoveryState
+from filament_force.protection import SampleHealth
 
 
 @pytest.fixture
@@ -169,11 +172,55 @@ def test_no_pause_ack_blocks_preparation(
     monitor._trip(TripKind.JAM, "fault", source="band")
     assert monitor._recovery.state is RecoveryState.FAILED
     assert gcode.run_script_from_command.call_args_list == [call("PAUSE\nM400")]
-    monitor.printer.invoke_shutdown.assert_called_once()
+    cast(Mock, monitor.printer).invoke_shutdown.assert_called_once()
 
 
 def test_pause_exception_escalates_to_shutdown(monitor: FilamentForce, gcode: Mock) -> None:
     gcode.run_script_from_command.side_effect = RuntimeError("pause failed")
     monitor._trip(TripKind.JAM, "fault", source="hard")
-    monitor.printer.invoke_shutdown.assert_called_once()
+    cast(Mock, monitor.printer).invoke_shutdown.assert_called_once()
     assert monitor._recovery.state is RecoveryState.FAILED
+
+
+def test_watchdog_stops_print_when_stream_is_stale(
+    monitor: FilamentForce, gcode: Mock, stats: Mock,
+) -> None:
+    monitor.enabled = True
+    monitor._sample_health = SampleHealth()
+    monitor.sensor_timeout_s = 2.0
+    monitor._watchdog_started = 0.0
+    monitor._protection_queued = False
+    monitor._force_ref_locked = False
+    monitor._baseline_wait_since = None
+    monitor._diag = FreeAirDiagnostic()
+    monitor._cal = OhShitCal()
+    monitor._spike.active = False
+    reactor = cast(Mock, monitor.reactor)
+    monitor._protection_watchdog(1.9)
+    reactor.register_callback.assert_not_called()
+    monitor._protection_watchdog(2.0)
+    callback = reactor.register_callback.call_args.args[0]
+    monitor._protection_watchdog(2.25)
+    reactor.register_callback.assert_called_once()
+
+    # The simulated G-code script contains an actual newline.
+    gcode.run_script_from_command.side_effect = lambda _script: stats.get_status.configure_mock(
+        return_value={"state": "paused"}
+    )
+    callback(2.25)
+    assert monitor.actions.pending_reason == "protection"
+    assert monitor._recovery.state is RecoveryState.FAILED
+    assert monitor._protection_fault == "load cell stream stale"
+    assert not monitor._protection_queued
+    cast(Mock, monitor.printer).invoke_shutdown.assert_not_called()
+
+
+def test_stale_watchdog_callback_cannot_pause_new_job(
+    monitor: FilamentForce, gcode: Mock,
+) -> None:
+    monitor.enabled = True
+    monitor._protection_queued = True
+    monitor._diag_generation = 2
+    monitor._stop_unprotected(1, "load cell stream stale")
+    assert not monitor._protection_queued
+    gcode.run_script_from_command.assert_not_called()
