@@ -32,7 +32,7 @@ is not `~/klipper` (e.g. `./install.sh ~/kalico`). The script can copy
 Restart Klipper when no print is running. The installer preserves an existing CFG;
 merge new options manually. To update, run `git pull --ff-only` in the plugin
 repository, rerun `./install.sh` with the same firmware path, then restart.
-The experimental recovery branch is not the stable main branch.
+Recovery is now in main but remains experimental and requires hardware qualification.
 
 Moonraker update manager:
 
@@ -345,3 +345,20 @@ while Klippy remains running. The optional Hermes Monitor bridge stores
 received events in SQLite and forwards their JSON payload. No network calls
 or disk writes in the force sampling callback. Recovery attempt budget resets
 after 60 s of healthy observed printing by default; total attempts are separate.
+
+
+## Engineering documentation
+
+![System architecture](docs/media/en/01-system.svg)
+
+- [Installation](docs/INSTALL.md)
+- [Configuration](docs/CONFIGURATION.md)
+- [User guide](docs/USER_GUIDE.md)
+- [Architecture](docs/ARCHITECTURE.md)
+- [Algorithm](docs/ALGORITHM.md)
+- [Diagnosis & recovery](docs/RECOVERY.md)
+- [Event protocol](docs/EVENTS.md)
+- [Troubleshooting](docs/TROUBLESHOOTING.md)
+- [Testing](docs/TESTING.md)
+
+Documentation baseline: main 25b359b. Source features merged; live acceptance remains outstanding.

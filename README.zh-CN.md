@@ -15,7 +15,7 @@ cd klipper-filament-force
 ./install.sh ~/klipper
 ```
 
-如果 Kalico 实际源码目录为 ~/kalico，则执行 `./install.sh ~/kalico`。安装器建立从 `klippy/extras/filament_force/` 到仓库 `src/filament_force/` 的符号链接，清理缓存，交互询问是否复制配置与重启服务。已有配置不会覆盖；不需要 pip 安装。当前恢复功能位于实验分支 feature/diagnostic-recovery-fsm，未通过全部集成及实机验证前不要用于生产打印。
+如果 Kalico 实际源码目录为 ~/kalico，则执行 `./install.sh ~/kalico`。安装器建立从 `klippy/extras/filament_force/` 到仓库 `src/filament_force/` 的符号链接，清理缓存，交互询问是否复制配置与重启服务。已有配置不会覆盖；不需要 pip 安装。恢复功能已合入 main，但仍为实验功能，未通过实机验收前不要用于生产打印。
 
 在 printer.cfg 中加入：
 
@@ -63,7 +63,7 @@ post_update_script: install.sh
 - FILAMENT_FORCE_JAM_ACTION：诊断前准备。核心已暂停；自定义宏负责安全停靠、浮空、废料处理。参数 TOOL、SOURCE、FORCE_G、E_SPEED、TARGET、FIRST_LAYER。
 - FILAMENT_FORCE_CONFIRMED_JAM_ACTION：浮空重复高阻力时调用。另含 DIAG_MEAN_G、DIAG_PEAK_G、RESULT。默认提示并保持暂停；不要从该宏直接恢复。
 
-配置示例（均为实验分支参数，诊断力限制需标定）：
+配置示例（均为 main 中的实验功能参数，诊断力限制需标定）：
 
 ```ini
 [filament_force]
@@ -143,3 +143,20 @@ uv run ty check src tests
 ## 原生事件与远程监控
 
 参见 [事件协议（中英文）](docs/events.md)。原生 Klippy 事件 filament_force:<kind> 与状态对象 filament_force.events 同时提供，堵头事件包含故障前受力轨迹、窗口统计与唯一 ID。默认保留 30 秒轨迹、最多 512 个保峰降采样点及最近 16 个事件；非完整原始 ADC 数据。Monitor 可经 Moonraker 订阅并将事件及 JSON 数据写入 SQLite、转发 Hermes。连续健康打印默认 60 秒后重置连续恢复次数，单任务累计次数独立记录。
+
+
+## 工程文档导航
+
+![总体架构](docs/media/zh-CN/01-system.svg)
+
+- [安装与升级](docs/INSTALL.zh-CN.md)
+- [配置参考](docs/CONFIGURATION.zh-CN.md)
+- [用户手册](docs/USER_GUIDE.zh-CN.md)
+- [系统架构](docs/ARCHITECTURE.zh-CN.md)
+- [检测算法](docs/ALGORITHM.zh-CN.md)
+- [诊断与恢复](docs/RECOVERY.zh-CN.md)
+- [事件协议](docs/EVENTS.zh-CN.md)
+- [故障排查](docs/TROUBLESHOOTING.zh-CN.md)
+- [测试与验收](docs/TESTING.zh-CN.md)
+
+文档依据 main 25b359b。功能代码已合并，实机验收尚未完成。
