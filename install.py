@@ -171,6 +171,28 @@ def prompt_restart_klipper() -> None:
         )
 
 
+def install_moonraker(moonraker_dir: Path, repo_dir: Path) -> Path:
+    components = moonraker_dir / "moonraker" / "components"
+    if not components.is_dir() or not (components / "klippy_apis.py").is_file():
+        raise ValueError(f"Not a Moonraker checkout: {moonraker_dir}")
+    source = repo_dir / "src" / "filament_force_events.py"
+    if not source.is_file():
+        raise ValueError(f"Component source missing: {source}")
+    link = components / "filament_force_events.py"
+    if link.is_symlink() and link.resolve() != source.resolve():
+        raise ValueError(f"Refusing to replace unrelated symlink: {link}")
+    if link.exists() and not link.is_symlink():
+        raise ValueError(f"Refusing to replace existing component: {link}")
+    if not link.is_symlink():
+        link.symlink_to(source.resolve())
+    ensure_git_exclude(moonraker_dir, "moonraker/components/filament_force_events.py")
+    stale = components / "__pycache__"
+    if stale.is_dir():
+        for path in stale.glob("filament_force_events.*.pyc"):
+            path.unlink()
+    return link
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Install filament_force into a Klipper extras directory."
@@ -181,12 +203,21 @@ def main() -> None:
         default=os.path.expanduser("~/klipper"),
         help="Klipper checkout (default: ~/klipper)",
     )
+    parser.add_argument("--moonraker-dir", type=Path, default=None,
+                        help="Optionally install the event component into this Moonraker checkout")
     args = parser.parse_args()
 
     repo_dir = Path(__file__).resolve().parent
     klipper_dir = Path(args.klipper_dir).expanduser().resolve()
 
     install(klipper_dir, repo_dir)
+    if args.moonraker_dir is not None:
+        try:
+            link = install_moonraker(args.moonraker_dir.expanduser().resolve(), repo_dir)
+        except ValueError as exc:
+            parser.error(str(exc))
+        print(f"Moonraker component: {link}")
+        print("Add [filament_force_events] to moonraker.conf, then restart Moonraker.")
     offer_example_config(repo_dir)
     print("Add to printer.cfg:")
     print(f"  [include {EXAMPLE_CFG}]")

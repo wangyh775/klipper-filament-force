@@ -31,3 +31,13 @@ def test_copy_example_cfg_does_not_overwrite(tmp_path: Path) -> None:
     dest.write_text("mine\n")
     assert copy_example_cfg(src, dest) is False
     assert dest.read_text() == "mine\n"
+
+
+def test_optional_moonraker_component_install(tmp_path: Path) -> None:
+    components = tmp_path / "moonraker" / "components"
+    components.mkdir(parents=True)
+    (components / "klippy_apis.py").touch()
+    link = _install.install_moonraker(tmp_path, ROOT)
+    assert link.is_symlink()
+    assert link.resolve() == ROOT / "src" / "filament_force_events.py"
+    assert _install.install_moonraker(tmp_path, ROOT) == link

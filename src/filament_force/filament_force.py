@@ -1891,7 +1891,14 @@ class FilamentForce:
                             pulse_peaks_g=[p.peak_g for p in d.pulses],
                             extruded_mm=d.extruded_mm)
         if d.result is Diagnosis.RESTRICTION_SUSPECTED:
-            self._publish_event("jam_confirmed", result=d.result.value)
+            if self.event_enabled:
+                self._publish_event(
+                    "jam_confirmed", result=d.result.value,
+                    window_event_id=self._incident_id,
+                    window=self._event_journal.incident_window(self._incident_id),
+                    diagnostic_speed_mm_s=speed,
+                    pulse_means_g=[p.mean_g for p in d.pulses],
+                    pulse_peaks_g=[p.peak_g for p in d.pulses])
             self._recovery.state = RecoveryState.CONFIRMED_JAM
             mean = max((p.mean_g for p in d.pulses), default=0.0)
             peak = max((p.peak_g for p in d.pulses), default=0.0)

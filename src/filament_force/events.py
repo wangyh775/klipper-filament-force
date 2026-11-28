@@ -69,5 +69,12 @@ class EventJournal:
         self.events.append(deepcopy(event))
         return deepcopy(event)
 
+    def incident_window(self, event_id: str | None) -> dict[str, Any] | None:
+        if event_id is not None:
+            for event in reversed(self.events):
+                if event["event_id"] == event_id and isinstance(event.get("window"), dict):
+                    return deepcopy(event["window"])
+        return None
+
     def status(self) -> list[dict[str, Any]]:
         return deepcopy(list(self.events))
