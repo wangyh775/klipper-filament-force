@@ -2645,8 +2645,18 @@ class FilamentForce:
             f" source={self._diag_trip_source or '-'}\n"
             f"  recovery={self._recovery.state.value}"
             f" attempts={self._recovery.attempts}"
+            f" ordinary={self._recovery.ordinary_attempts}/{self.auto_resume_max_attempts}"
+            f" incident={self._recovery.incident_attempts}"
+            f" job_total={self._recovery_total}/{self.auto_resume_job_max_attempts}"
+            f" manual={self._recovery.manual_attempts}"
             f" verified={self._recovery.healthy}"
-            f" failure={self._recovery.failure or '-'}"
+            f" failure={self._recovery.failure or '-'}\n"
+            f"  protection_fault={self._protection_fault or '-'}"
+            f" sensor_age_s={self._sample_health.age(self.reactor.monotonic())}\n"
+            f"  z_owned={self._z_ownership.applied_mm:.3f}mm"
+            f" staged={self._z_ownership.staged_step:.3f}mm"
+            f" cleanup_pending={int(self._z_ownership.cleanup_pending)}"
+            f" uncertain={int(self._z_ownership.uncertain)}"
         )
 
     cmd_FILAMENT_FORCE_SET_TOOL_help = (

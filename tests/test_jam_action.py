@@ -226,3 +226,63 @@ def test_stale_watchdog_callback_cannot_pause_new_job(
     monitor._stop_unprotected(1, "load cell stream stale")
     assert not monitor._protection_queued
     gcode.run_script_from_command.assert_not_called()
+
+
+def test_z_cleanup_checks_observed_origin(
+    monitor: FilamentForce, gcode: Mock, stats: Mock, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stats.get_status.return_value = {"state": "complete"}
+    owned = monitor._z_ownership
+    owned.stage(.1, .12, .02)
+    owned.commit(.12)
+    owned.finish_job()
+    origin = Mock(side_effect=[.12, .1])
+    monkeypatch.setattr(monitor, "_current_z_origin", origin)
+    monitor._undo_recovery_z(monitor._diag_generation)
+    gcode.run_script_from_command.assert_called_once_with("SET_GCODE_OFFSET Z_ADJUST=-0.020000 MOVE=0")
+    assert not owned.cleanup_pending and owned.applied_mm == 0
+
+
+def test_z_cleanup_refuses_new_print_without_losing_record(
+    monitor: FilamentForce, gcode: Mock,
+) -> None:
+    owned = monitor._z_ownership
+    owned.stage(.1, .12, .02)
+    owned.commit(.12)
+    owned.finish_job()
+    monitor._undo_recovery_z(monitor._diag_generation)
+    gcode.run_script_from_command.assert_not_called()
+    assert owned.cleanup_pending and owned.uncertain and owned.applied_mm == .02
+
+
+def test_z_cleanup_callback_does_not_touch_new_generation(
+    monitor: FilamentForce, gcode: Mock,
+) -> None:
+    owned = monitor._z_ownership
+    owned.stage(.1, .12, .02)
+    owned.commit(.12)
+    owned.finish_job()
+    monitor._undo_recovery_z(monitor._diag_generation - 1)
+    gcode.run_script_from_command.assert_not_called()
+    assert owned.cleanup_pending and not owned.uncertain
+
+
+def test_manual_recovery_preparation_failure_keeps_pending_reason(
+    monitor: FilamentForce, gcode: Mock, stats: Mock, legacy_hook: Mock,
+) -> None:
+    stats.get_status.return_value = {"state": "paused"}
+    monitor._diag = FreeAirDiagnostic()
+    monitor.actions.set_pending(tool=0, target=400, reason="jam")
+    monitor._recovery.fail("jam")
+    monitor._recovery.record_auto_attempt(first=False)
+    legacy_hook.side_effect = RuntimeError("recover macro failed")
+    command = Mock()
+    command.get.return_value = None
+    command.error.side_effect = RuntimeError
+    with pytest.raises(RuntimeError, match="manual recovery failed"):
+        monitor.cmd_FILAMENT_FORCE_RESUME(command)
+    assert monitor.actions.pending_recheck and monitor.actions.pending_reason == "jam"
+    assert monitor._recovery.state is RecoveryState.FAILED
+    assert monitor._recovery.manual_attempts == 1
+    assert monitor._recovery.attempts == 1
+    gcode.run_script_from_command.assert_not_called()
