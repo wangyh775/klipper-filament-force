@@ -346,3 +346,7 @@ while Klippy remains running. The optional Moonraker component broadcasts named 
 of every consumer. See [installation and protocol](docs/events.md). No network calls
 or disk writes in the force sampling callback. Recovery attempt budget resets
 after 60 s of healthy observed printing by default; total attempts are separate.
+
+### Independent fault pause and resume
+
+Use `FILAMENT_FORCE_PAUSE` and `FILAMENT_FORCE_RESUME` for module-owned faults; override `FILAMENT_FORCE_PAUSE_ACTION` and `FILAMENT_FORCE_RESUME_ACTION` independently as weak user macros. Defaults reuse native PAUSE/RESUME (existing resume_gcode is preserved). Ordinary pauses remain independent. See [pause/resume interface](docs/pause-resume.md).

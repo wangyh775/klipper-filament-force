@@ -34,6 +34,8 @@ Connect to the standard /websocket endpoint (normally port 7125), authenticate a
 | `filament_force:recovery_verified` | `notify_filament_force_recovery_verified` | Healthy verification windows |
 | `filament_force:recovery_failed` | `notify_filament_force_recovery_failed` | Recovery or protection failed |
 | `filament_force:sensor_fault` | `notify_filament_force_sensor_fault` | Sensor or baseline fault |
+| `filament_force:pause` | `notify_filament_force_pause` | Owned fault pause acknowledged |
+| `filament_force:resume` | `notify_filament_force_resume` | Owned fault resume acknowledged |
 
 ## Example: jam notification
 
@@ -117,3 +119,5 @@ event_max_points: 512
 The component broadcasts the retained initial snapshot and subsequent journal updates, deduplicated by boot_id and seq in the current Moonraker process. Reconnect to the same process does not re-broadcast previously seen events; a Moonraker restart may replay the last 16 events. Consumers should deduplicate using event_id and can query retained history after connecting. Initial detection has incident_id=null, later events refer to its event_id. A sequence gap can be logged but discarded data cannot be recovered. This is best-effort broadcast, not a durable queue, per-client ACK or exactly-once transport. The journal is finite and resets with Klippy; disconnects, shutdowns and long outages may lose events. Local protection never waits for notification delivery.
 
 Klipper/Moonraker API integration and actual broadcast latency require testing on the target printer. The supplied automated tests simulate Moonraker's component API; no physical printer motion is involved.
+
+Pause/resume events include pause_id, pause_owner, pause_reason, pause_incident_id, pause_phase, pause_requested, pause_acknowledged, resume_acknowledged, resume_mode and print_state. Native PAUSE/RESUME states are unchanged; see [independent pause/resume](pause-resume.md).

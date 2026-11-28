@@ -34,6 +34,8 @@ sudo systemctl restart moonraker
 | `filament_force:recovery_verified` | `notify_filament_force_recovery_verified` | 恢复受力验证通过 |
 | `filament_force:recovery_failed` | `notify_filament_force_recovery_failed` | 恢复或保护失败 |
 | `filament_force:sensor_fault` | `notify_filament_force_sensor_fault` | 传感器或基准异常 |
+| `filament_force:pause` | `notify_filament_force_pause` | 模块故障暂停确认 |
+| `filament_force:resume` | `notify_filament_force_resume` | 模块故障恢复确认 |
 
 ## 示例：堵头通知
 
@@ -117,3 +119,5 @@ event_max_points: 512
 组件广播首次订阅的保留快照及后续队列变化，在当前 Moonraker 进程按 boot_id、seq 去重。同一进程重连不会重复广播已见事件；Moonraker 重启可能重播最近 16 条事件。消费端应按 event_id 去重，连接后可查询有限历史。首次检测 incident_id=null，后续事件引用其 event_id。序号缺失可记录日志，但无法找回已淘汰数据。这是尽力广播，不提供持久化队列、逐客户端 ACK 或严格一次语义。Klippy 重启清空队列，断线、停机及长时间中断可能丢失事件。本地保护不等待通知投递。
 
 需要在目标打印机验证 Klipper/Moonraker API 集成及实际广播延迟。自动测试模拟 Moonraker 组件 API，不涉及实机运动。
+
+暂停恢复事件含 pause_id、pause_owner、pause_reason、pause_incident_id、pause_phase、pause_requested、pause_acknowledged、resume_acknowledged、resume_mode、print_state；原生 PAUSE/RESUME 状态保持不变，详见 [独立暂停恢复](pause-resume.md)。

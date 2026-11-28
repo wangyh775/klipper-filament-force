@@ -2079,7 +2079,10 @@ class FilamentForce:
             self._execute_fault_resume(None, "automatic")
             if generation != self._diag_generation:
                 return
-            if self._jam_action_paused() or not self.actions.is_printing():
+            acknowledged = self._wait_fault_resume_ack(generation)
+            if generation != self._diag_generation:
+                return
+            if not acknowledged:
                 raise RuntimeError("resume not acknowledged")
             self._acknowledge_fault_resume("automatic")
             if expected_origin is not None:
@@ -2277,17 +2280,31 @@ class FilamentForce:
         self.gcode.run_script_from_command(
             f"{_RESUME_ACTION} MODE={mode} REASON={self._pause_context.reason}" + suffix)
 
+    def _wait_fault_resume_ack(self, generation: int) -> bool:
+        # virtual_sdcard.do_resume schedules work_handler; print_stats changes
+        # in that handler, not necessarily before the native command returns.
+        deadline = self.reactor.monotonic() + 2.0
+        while generation == self._diag_generation:
+            if not self._jam_action_paused() and self.actions.is_printing():
+                return True
+            now = self.reactor.monotonic()
+            if not self.actions.in_print_job() or now >= deadline:
+                return False
+            self.reactor.pause(min(now + 0.05, deadline))
+        return False
+
     def _acknowledge_fault_resume(self, mode: str) -> None:
         self._pause_context.resume(mode)
-        self._publish_event("resume", **self._pause_context.status())
+        self._publish_event("resume", print_state=self.actions.print_stats_state(),
+                            **self._pause_context.status())
 
     def _default_confirmed_jam_action(self, _gcmd: GCodeCommand) -> None:
         self.gcode.respond_info("filament_force: free-air high resistance; inspect while paused")
 
     def _default_jam_action(self, _gcmd: GCodeCommand) -> None:
-        """Pause after a learned-band filament jam."""
+        """Default post-pause preparation is a no-op; never pause independently."""
         if not self._jam_action_paused():
-            self.gcode.run_script_from_command("PAUSE\nM400")
+            self.gcode.respond_info("filament_force: JAM_ACTION requires a fault pause")
 
     def _jam_action_paused(self) -> bool:
         pause = self.printer.lookup_object("pause_resume", None)
@@ -2309,7 +2326,8 @@ class FilamentForce:
                 f"{_PAUSE_ACTION} REASON={category}\nM400")
             if self._jam_action_paused():
                 self._pause_context.acknowledge()
-                self._publish_event("pause", **self._pause_context.status())
+                self._publish_event("pause", print_state=self.actions.print_stats_state(),
+                                    **self._pause_context.status())
                 return True
         except Exception:
             logging.exception("filament_force fault pause failed")
@@ -2331,8 +2349,10 @@ class FilamentForce:
         self._incident_recoverable = False
         self.actions.set_pending(tool=self.active_tool, target=self.actions.extruder_target(),
                                  reason="manual")
-        self._fail_recovery("explicit fault pause")
+        self._recovery.state = RecoveryState.WAITING_RECOVERY
+        self._recovery.clearance = False
         if not self._ensure_fault_pause("explicit fault pause"):
+            self._fail_recovery("explicit fault pause not acknowledged")
             raise gcmd.error("filament_force: fault pause not acknowledged")
 
     def _run_jam_action(self, tool: int, target: float, force_g: float) -> None:
@@ -2984,7 +3004,10 @@ class FilamentForce:
             self._execute_fault_resume(velocity, "manual")
             if generation != self._diag_generation:
                 return
-            if self._jam_action_paused() or not self.actions.is_printing():
+            acknowledged = self._wait_fault_resume_ack(generation)
+            if generation != self._diag_generation:
+                return
+            if not acknowledged:
                 raise RuntimeError("manual resume not acknowledged")
             self._acknowledge_fault_resume("manual")
             self._recovery.state = RecoveryState.MONITORING

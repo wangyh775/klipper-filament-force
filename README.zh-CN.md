@@ -143,3 +143,7 @@ uv run ty check src tests
 ## 原生事件与远程监控
 
 参见 [事件协议（中英文）](docs/events.md)。原生 Klippy 事件 filament_force:<kind> 与状态对象 filament_force.events 同时提供，堵头事件包含故障前受力轨迹、窗口统计与唯一 ID。默认保留 30 秒轨迹、最多 512 个保峰降采样点及最近 16 个事件；非完整原始 ADC 数据。可选 Moonraker 组件注册并广播独立的 `notify_filament_force_*` JSON-RPC 通知，携带完整事件负载，且不依赖任何消费端。安装及协议见 [事件接口](docs/events.zh-CN.md)。连续健康打印默认 60 秒后重置连续恢复次数，单任务累计次数独立记录。
+
+### 独立故障暂停与恢复
+
+使用 `FILAMENT_FORCE_PAUSE`、`FILAMENT_FORCE_RESUME` 管理模块所有的故障暂停；自定义 `FILAMENT_FORCE_PAUSE_ACTION`、`FILAMENT_FORCE_RESUME_ACTION` 弱定义宏覆盖执行动作。未定义时复用原生 PAUSE/RESUME（已有 resume_gcode 保留）。普通暂停不由模块接管。详见 [暂停恢复接口](docs/pause-resume.md)。

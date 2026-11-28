@@ -101,7 +101,7 @@ def test_both_weak_actions_are_registered(
         call("FILAMENT_FORCE_RESUME_ACTION", monitor._default_fault_resume_action),
     ]
     monitor._default_jam_action(Mock())
-    gcode.run_script_from_command.assert_called_once_with("PAUSE\nM400")
+    gcode.run_script_from_command.assert_not_called()
 
 
 def test_custom_action_overrides_only_its_own_hook(
@@ -498,3 +498,42 @@ def test_weak_defaults_reuse_native_commands(monitor: FilamentForce, gcode: Mock
     command.get.return_value = "25"
     monitor._default_fault_resume_action(command)
     assert gcode.run_script_from_command.call_args_list == [call("PAUSE"), call("RESUME VELOCITY=25")]
+
+
+def test_resume_ack_waits_for_virtual_sd_status(monitor: FilamentForce, stats: Mock,
+                                                monkeypatch: pytest.MonkeyPatch) -> None:
+    stats.get_status.return_value = {"state": "paused"}
+    reactor = cast(Mock, monitor.reactor)
+    reactor.monotonic.return_value = 1.0
+    monkeypatch.setattr(monitor, "_jam_action_paused", lambda: False)
+    reactor.pause.side_effect = lambda _t: stats.get_status.configure_mock(
+        return_value={"state": "printing"})
+    assert monitor._wait_fault_resume_ack(monitor._diag_generation)
+    reactor.pause.assert_called_once()
+
+
+def test_resume_ack_timeout_does_not_emit_resume(monitor: FilamentForce, stats: Mock,
+                                                 monkeypatch: pytest.MonkeyPatch) -> None:
+    stats.get_status.return_value = {"state": "paused"}
+    reactor = cast(Mock, monitor.reactor)
+    reactor.monotonic.side_effect = [1.0, 3.0]
+    # print_stats queries the same reactor, so use fixed test state here.
+    monkeypatch.setattr(monitor.actions, "is_printing", lambda: False)
+    monkeypatch.setattr(monitor.actions, "in_print_job", lambda: True)
+    monkeypatch.setattr(monitor, "_jam_action_paused", lambda: True)
+    assert not monitor._wait_fault_resume_ack(monitor._diag_generation)
+    reactor.register_callback.assert_not_called()
+
+
+def test_explicit_fault_pause_does_not_fabricate_jam(monitor: FilamentForce, gcode: Mock,
+                                                     stats: Mock, monkeypatch: pytest.MonkeyPatch) -> None:
+    publish = Mock()
+    monkeypatch.setattr(monitor, "_publish_event", publish)
+    gcode.run_script_from_command.side_effect = lambda _s: stats.get_status.configure_mock(
+        return_value={"state": "paused"})
+    monitor.cmd_FILAMENT_FORCE_PAUSE(Mock())
+    assert monitor.actions.pending_reason == "manual"
+    assert monitor._recovery.state is RecoveryState.WAITING_RECOVERY
+    assert monitor._pause_context.owned
+    assert publish.call_args.args == ("pause",)
+    assert publish.call_count == 1

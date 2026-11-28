@@ -19,3 +19,7 @@ Status filament_force.pause_context contains pause_id, pause_owner, pause_reason
 普通 PAUSE/RESUME 不变。FILAMENT_FORCE_PAUSE 显式请求模块暂停（manual 原因，不伪造堵头）；自动检测走同一内部暂停入口。FILAMENT_FORCE_RESUME 仅授权恢复已确认归本模块所有的故障暂停，不恢复普通暂停。自动恢复复用同一执行宏。上方两个 ACTION 宏可分别弱定义覆盖，未定义时分别复用 PAUSE 和 RESUME（已有 resume_gcode 优先保留）。强命令负责事务、保护及事件，禁止用 ACTION 递归调用其自身生命周期命令。自动恢复仍需经过已验证的自定义恢复宏或 resume_gcode 及原有门控；原 JAM_ACTION 仍在暂停确认后执行诊断准备。
 
 pause_context 提供暂停 ID、所有者、原因、故障 ID、阶段、确认及恢复方式；确认成功才发 pause/resume 事件，原堵头数据窗口不变。普通状态推送保留，消费方自行关联。resumed 为历史上下文，不代表仍持有暂停；任务重置清除。已由外部暂停的任务不抢占所有权。原生 RESUME 未被拦截，绕过故障锁存由原有看门狗检测并重新暂停，非瞬时拦截。已暂停时再次发普通 PAUSE 无法仅凭原生状态识别，需用户宏协作；不得假定存在冲突指令时自动恢复安全。故障待处理时禁止模型重置。尚需实机验证宏兼容性。
+
+Resume acknowledgement allows up to 2 seconds for virtual_sdcard to update print_stats after the native pause flag clears. On timeout or macro error, the fault latch and existing safety escalation are retained. The default JAM_ACTION is now a no-op after the confirmed fault pause. The normal PAUSE/RESUME state notifications are still emitted by the firmware; consumers decide whether to show both.
+
+恢复确认最多等待 2 秒供 virtual_sdcard 更新 print_stats；超时或宏异常保留故障锁存及既有保护升级。默认 JAM_ACTION 在确认暂停后不执行额外动作。固件仍产生原生状态变化通知，消费端决定是否合并呈现。
