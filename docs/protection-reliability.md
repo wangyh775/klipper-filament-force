@@ -3,3 +3,9 @@
 A failed PAUSE acknowledgement on an active job now escalates to Klippy shutdown, not a hardware interlock. Diagnostic baseline and middle pulse samples require monotonic timestamps and maximum adjacent/edge gap (diagnostic_max_sample_gap_s=0.05). Verification evidence expires after confirm_max_gap_s; a missing/unvalidated reference clears evidence. Repeated first-layer compensation requires the same speed bin and ±20% incident speed. A queued verification retry checks both generation and VERIFYING state. No changes to Z cleanup or the core statistical algorithm.
 
 活动任务暂停未确认时升级 Klippy shutdown，不代替硬件联锁。诊断基准与脉冲中段须满足严格递增时间戳及相邻/端点最大间隔（diagnostic_max_sample_gap_s=0.05）。恢复验证证据沿用 confirm_max_gap_s，缺失或未验证参考清除证据。首层再次补偿要求同速度组且与故障速度偏差 ≤20%。排队的恢复重试需同时核对任务代次及 VERIFYING 状态。未修改 Z 撤销或核心统计算法。实机验证仍必需。
+
+## Independent watchdog / 独立看门狗
+
+While a print is active and monitoring is enabled, a 250 ms timer checks advancing finite sensor timestamps and an absent force baseline after eligible E motion. The timer is excluded during explicit suppression, calibration, spike test, diagnosis and preparation/resuming. Sensor timeout 2 s, baseline timeout 3 s, normal baseline max span 100 gf and at least five samples, max gap 0.1 s. These defaults require hardware qualification. On fault, pause with pending reason protection; do not authorize automatic recovery. Manual recovery requires fresh samples. A baseline timeout limits rather than removes the initial blind interval. Status includes protection_fault and sensor_last_sample_age_s; recovery_failed carries the reason. Dedicated sensor events and pre-resume baseline qualification remain future work.
+
+监控已启用且打印时，独立 250 ms 定时器检查有效递增采样及有效 E 运动后缺少基准。显式抑制、标定、探测、诊断、准备及恢复动作期间除外。断流默认 2 s、基准超时 3 s、正常基准跨度 100 gf、最少 5 点且最大间隔 0.1 s；须实机验证。故障暂停并锁存 protection 原因，不授权自动恢复；人工恢复须有新鲜样本。超时仅限制盲区，不消除盲区。状态含 protection_fault 和 sensor_last_sample_age_s，复用 recovery_failed 携带原因。独立传感器事件和恢复前基准验证仍待实现。

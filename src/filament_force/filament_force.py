@@ -39,6 +39,7 @@ from .model_store import ModelStore, snapshot
 from .free_air import Diagnosis, FreeAirDiagnostic
 from .recovery import ForceReference, Recovery, RecoveryState, shifted_pause_state
 from .events import EventJournal
+from .protection import SampleHealth, StableBaseline
 
 if TYPE_CHECKING:
     from klippy.configfile import ConfigWrapper
@@ -307,6 +308,15 @@ class FilamentForce:
         self.min_e_speed: float = config.getfloat("min_e_speed", 0.5, above=0.0)
         self.rolling_window: float = config.getfloat("rolling_window", 0.05, above=0.0)
         self.baseline_time: float = config.getfloat("baseline_time", 0.15, above=0.0)
+        self.baseline_max_span_g = config.getfloat("baseline_max_span_g", 100.0, above=0.0)
+        self.baseline_timeout_s = config.getfloat("baseline_timeout_s", 3.0, above=0.0)
+        self.sensor_timeout_s = config.getfloat("sensor_timeout_s", 2.0, above=0.0)
+        self._sample_health = SampleHealth()
+        self._baseline = StableBaseline()
+        self._baseline_wait_since: float | None = None
+        self._watchdog_started: float | None = None
+        self._protection_queued = False
+        self._protection_fault = ""
         self.min_delta_g: float = config.getfloat("min_delta_g", 15.0, above=0.0)
         self.high_sigma: float = config.getfloat("high_sigma", 4.0, above=0.0)
         self.sigma_jam: bool = config.getboolean("sigma_jam", True)
@@ -384,9 +394,6 @@ class FilamentForce:
         )
         self._force_ref: float = 0.0
         self._force_ref_locked: bool = False
-        self._ref_sum: float = 0.0
-        self._ref_n: int = 0
-        self._ref_started: float | None = None
         self._seen_forward_e: bool = False
         self._idle_confirmed: bool = False
         self._last_force: float = 0.0
@@ -741,6 +748,8 @@ class FilamentForce:
         del args
         self._save_model_store(checkpoint=True)
         self._diag_generation += 1
+        self._watchdog_started = None
+        self._protection_fault = ""
         self._recovery = Recovery()
         self._incident_id = None
         self._incident_filename = ""
@@ -834,6 +843,7 @@ class FilamentForce:
         self._poll_timer = self.reactor.register_timer(
             self._poll_event, self.reactor.NEVER
         )
+        self.reactor.register_timer(self._protection_watchdog, self.reactor.NOW)
         # Moonraker subscribes to G-code output after Klipper becomes ready.
         self.reactor.register_callback(
             self._announce_ready, self.reactor.monotonic() + 2.0
@@ -905,9 +915,8 @@ class FilamentForce:
         """
         self._force_ref = 0.0
         self._force_ref_locked = False
-        self._ref_sum = 0.0
-        self._ref_n = 0
-        self._ref_started = None
+        self._baseline.reset()
+        self._baseline_wait_since = None
         self._seen_forward_e = False
         self._idle_confirmed = False
         self._jam_above_since = None
@@ -921,9 +930,60 @@ class FilamentForce:
         if self._poll_timer is not None:
             self.reactor.update_timer(self._poll_timer, self.reactor.NEVER)
 
+    def _protection_watchdog(self, eventtime: float) -> float:
+        # Independent of E-window completion and the sample callback.
+        next_time = eventtime + 0.25
+        if (not self.enabled or not self.actions.is_printing() or self.suppress
+                or self._cal.active or self._spike.active or self._diag.active
+                or self._triggering or self._recovery.state in
+                (RecoveryState.PREPARING, RecoveryState.RESUMING)):
+            self._watchdog_started = None
+            return next_time
+        if self._jam_action_paused():
+            self._watchdog_started = None
+            return next_time
+        if self._watchdog_started is None:
+            self._watchdog_started = eventtime
+        reason = ""
+        if self.actions.pending_recheck:
+            reason = "unacknowledged fault pause or bypassed resume"
+        elif self._sample_health.stale(eventtime, self._watchdog_started, self.sensor_timeout_s):
+            reason = "load cell stream stale"
+        elif (not self._force_ref_locked and self._baseline_wait_since is not None
+              and eventtime - self._baseline_wait_since >= self.baseline_timeout_s):
+            reason = "force baseline unavailable"
+        if reason and not self._protection_queued:
+            self._protection_queued = True
+            generation = self._diag_generation
+            self.reactor.register_callback(
+                lambda _t: self._stop_unprotected(generation, reason))
+        return next_time
+
+    def _stop_unprotected(self, generation: int, reason: str) -> None:
+        try:
+            with self.gcode.get_mutex():
+                if (generation != self._diag_generation or not self.actions.is_printing()
+                        or self._jam_action_paused() or not self.enabled or self.suppress):
+                    return
+                self._protection_fault = reason
+                self._diag_generation += 1
+                self._incident_recoverable = False
+                self._recovery.fail(reason)
+                self._window.reset()
+                self.actions.set_pending(tool=self.active_tool,
+                                         target=self.actions.extruder_target(), reason="protection")
+                self.gcode.respond_info("filament_force protection: " + reason)
+                self._publish_event("recovery_failed", reason=reason)
+                self._ensure_fault_pause(reason)
+        finally:
+            self._protection_queued = False
+
     def _force_client(self, msg: object) -> bool:
+        now = self.reactor.monotonic()
+        samples = force_signal.iter_load_cell_samples(msg)
+        fresh = [sample for sample in samples if self._sample_health.note(sample.timestamp, now)]
         if self._diag.active:
-            for sample in force_signal.iter_load_cell_samples(msg):
+            for sample in samples:
                 self._diag.note(sample)
             return True
         in_probe = self._spike.active or self._cal.active
@@ -933,7 +993,7 @@ class FilamentForce:
             return True
         if self._triggering and not in_probe:
             return True
-        for sample in force_signal.iter_load_cell_samples(msg):
+        for sample in fresh:
             self._last_force = sample.force
             if getattr(self, "event_enabled", False) and not in_probe and not self.actions.pending_recheck:
                 self._event_journal.note(sample)
@@ -947,17 +1007,11 @@ class FilamentForce:
                 and not self._seen_forward_e
                 and self._idle_confirmed
             ):
-                if self._ref_started is None:
-                    self._ref_started = sample.timestamp
-                self._ref_sum += sample.force
-                self._ref_n += 1
-                if sample.timestamp - self._ref_started >= self.baseline_time:
-                    ref = force_signal.force_ref_from_idle_samples(
-                        self._ref_n, self._ref_sum
-                    )
-                    if ref is not None:
-                        self._force_ref = ref
-                        self._force_ref_locked = True
+                ref = self._baseline.note(sample, self.baseline_time, self.baseline_max_span_g)
+                if ref is not None:
+                    self._force_ref = ref
+                    self._force_ref_locked = True
+                    self._baseline_wait_since = None
             # NB: poll_interval_ms lag (default 250ms) before idle is
             # visible here. Hops shorter than that still mix in. Do not
             # include samples once poll has marked E idle - time-average
@@ -1078,9 +1132,9 @@ class FilamentForce:
             # Do not lock ref=0 (or a partial motion average). |F-0| is
             # the cell preload (~2kg) and trips HIGH against a learned
             # filament band. Wait for E-idle samples in _force_client.
-            self._ref_sum = 0.0
-            self._ref_n = 0
-            self._ref_started = None
+            self._baseline.reset()
+            if self._baseline_wait_since is None:
+                self._baseline_wait_since = eventtime
             return next_time
         self._seen_forward_e = True
 
@@ -2179,6 +2233,8 @@ class FilamentForce:
             high_bound = band.high_bound
             last_z = hist.last_z_score
         return {
+            "protection_fault": self._protection_fault,
+            "sensor_last_sample_age_s": self._sample_health.age(self.reactor.monotonic()),
             "recovery_state": self._recovery.state.value,
             "recovery_attempts": self._recovery.attempts,
             "recovery_total_attempts": self._recovery_total,
@@ -2550,6 +2606,12 @@ class FilamentForce:
         if self._diag.active:
             raise gcmd.error("filament_force: diagnosis still running")
         velocity = gcmd.get("VELOCITY", None)
+        if self.actions.pending_reason == "protection":
+            age = self._sample_health.age(self.reactor.monotonic())
+            if age is None or age >= self.sensor_timeout_s:
+                raise gcmd.error("filament_force: protection requires fresh sensor samples")
+            self._unlock_baseline()
+            self._protection_fault = ""
         if self._recovery.state in (RecoveryState.PREPARING, RecoveryState.RESUMING):
             raise gcmd.error("filament_force: recovery strategy still running")
         self._diag_generation += 1
