@@ -25,3 +25,12 @@ Recovery requires opt-in, same tool/temperature, known layer, validated model an
 ![Fig. 9. Principal state transitions; all motion remains conditional.](media/en/09-fsm.svg)
 
 *Fig. 9. Principal state transitions; all motion remains conditional.*
+
+
+## Exact diagnostic and recovery gates
+
+For pulse j, mean m_j = average(|Fᵢ−F_idle|) over the middle 60% of the nominal interval; peak p_j is the maximum absolute deviation of captured pulse samples. A usable learned reference requires finite μ,σ, μ > min_delta_g > 0, σ ≥ 0 and high_sigma > 0. The diagnostic lower bound is max(min_delta_g, L_low); require 0 < lower < H < cap, without clamping H. Otherwise manual bounds may classify, but cannot authorize automatic recovery. The short-pulse statistic is not equivalent to the rolling printing statistic; cross-bin qualification is an empirical engineering assumption. Baseline is 0.8 s, nominal pulse at least 0.5 s, M400 and 0.3 s wait per pulse. Actual motion timing is planner-dependent.
+
+Recovery additionally requires a band/hard incident (not model_validation), known layer, both trusted bins/global reference, the same active extruder, actual and target temperatures each within 10 °C of the original positive target, heater.can_extrude, and a tested resume template. A hard trip during VERIFYING is diagnosed but cannot automatically recover. First-layer adjustment also requires every diagnostic pulse mean ≤ first_layer_z_max_force. Non-first-layer attempts use the ordinary budget; first-layer steps use the separate per-job Z budget.
+
+VERIFYING counts healthy windows and consecutive bad windows. NONE resets bad; a bad window resets healthy. A missing/unvalidated reference resets healthy; short windows are skipped. At confirm_windows bad (default 3), HIGH may retry if budget remains and first-layer normalized improvement is sufficient; LOW or insufficient improvement stops verification. Independent 60 s watchdog can pause even without usable windows. Failure is not always a recovery_failed event; inspect recovery_state and recovery_failure as well. A pause request is not an emergency hardware stop.

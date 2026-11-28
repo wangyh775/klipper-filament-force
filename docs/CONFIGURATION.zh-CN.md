@@ -74,3 +74,7 @@
 | `resume_gcode` | `unset` | template | — | — | 显式实测恢复路径 |
 
 不要在 include 中重复定义 SAVE_CONFIG 写入 printer.cfg 的 oh_shit_force。diagnostic_force_limit 为 0 时拒绝诊断，必须标定；不要把默认值当作安全载荷。旧模板参数 TOOL、TARGET、REASON、MSG；双弱定义宏有额外事件元数据，见 RECOVERY。
+
+## 动态修改与模型指纹
+
+指纹包含 profile、sensor、extruder、speed_bins、history_n、min_learn_windows、detection_length、min_e_speed、rolling_window、baseline_time、idle_reset_s、min_learn_s、poll_interval、min_delta_g、high_sigma、drop_ratio、runout_max_level_g。运行时修改指纹字段可能保存与原 CFG 不兼容的模型；参数验证后同步 CFG。detection_length、min_e_speed、idle_reset_s、min_learn_s、speed_bins、history_n、min_learn_windows 改变会重建历史并立即持久化重置。不要为消警重置。速度组边界须有限、严格递增且为正。

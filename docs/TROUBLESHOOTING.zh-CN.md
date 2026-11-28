@@ -16,3 +16,5 @@
 | 轨迹过短 | 实际传感器流、40000 点内存上限及窗口清除；不是完整 ADC 导出 |
 
 调阈值前收集 FILAMENT_FORCE_QUERY、klippy.log、配置。调试日志 FILAMENT_FORCE_SET DEBUG_LOG=1。不要为排查关闭绝对保护。
+
+冷启动或重置后的历史不保证健康；在故障原因明确前保留现有数据，参见[高级标定与误判处理](USER_GUIDE.zh-CN.md#高级标定与误判处理)。

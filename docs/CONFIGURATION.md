@@ -74,3 +74,7 @@ All entries belong to [filament_force]. Defaults below are source defaults, not 
 | `resume_gcode` | `unset` | template | — | — | Explicit tested resume path |
 
 Never duplicate an oh_shit_force written into printer.cfg by SAVE_CONFIG in an included file. `diagnostic_force_limit: 0` prevents diagnosis until calibrated. Do not infer a safe force from defaults. Hook parameters: TOOL, TARGET, REASON, MSG; the two weak macros have additional incident metadata (see RECOVERY).
+
+## Runtime changes and fingerprints
+
+The persisted fingerprint includes profile, sensor, extruder, speed_bins, history_n, min_learn_windows, detection_length, min_e_speed, rolling_window, baseline_time, idle_reset_s, min_learn_s, poll_interval, min_delta_g, high_sigma, drop_ratio and runout_max_level_g. Runtime changes to fingerprinted values may save a model incompatible with the unchanged CFG at restart. Synchronize CFG only after qualified tuning. Changes to detection_length, min_e_speed, idle_reset_s, min_learn_s, speed_bins, history_n or min_learn_windows rebuild histories and persist the reset immediately. Do not reset to silence a fault. Speed edges must be finite, strictly increasing and positive.

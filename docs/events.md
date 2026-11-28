@@ -53,3 +53,35 @@ Illustrative abbreviated schema, not measured values:
 ```
 
 For remote transport and routing figures see [Monitor](https://github.com/wangyh775/hermes-plugin-kalico-monitor/blob/main/docs/ARCHITECTURE.md).
+
+
+## Field reference and snapshot semantics
+
+| Field | Type | Meaning |
+|---|---|---|
+| schema, seq | integer | Version 1, increasing boot-local counter |
+| boot_id, event_id, kind, filename | string | Boot identity, source ID, event name, original filename |
+| incident_id | string/null | Parent detection ID, null for initial event |
+| host_monotonic_s | number | Host-local monotonic seconds |
+| source | string | band, hard, model_validation |
+| layer | integer/null | Known slicer layer, if available |
+| tool | integer | Active tool; -1 is default/unknown |
+| force_g | number | Window level for band/model_validation; absolute baseline-relative trigger reading for hard, not necessarily peak |
+| e_speed_mm_s, detection_length_mm | number | Incident commanded E speed (0 if unknown), window length |
+| target_c, absolute_limit_g | number | Original target °C, configured absolute limit gf |
+| window.clock, window.columns | string, array | MCU print-time clock, [t_s, force_g] |
+| window.start_time, window.force_ref_g | number/null | MCU time origin and locked reference |
+| window.duration_s, sample_count, returned_count, downsampled | number, integer, integer, boolean | Observed trace span and retained/transmitted counts |
+| window.samples | array of pairs | Relative seconds and signed calibrated gf, not baseline-subtracted |
+| window.windows | array of objects | Recent window summaries: host_monotonic_s, duration_s, e_speed_mm_s, force_g, bin, short_bead; scoring fields mean_g, stdev_g, z_score, anomaly, learned may be absent |
+| result, reason | string | Diagnosis result or covered failure reason |
+| diagnostic_speed_mm_s, extruded_mm | number | Diagnostic command speed and commanded E total |
+| pulse_means_g, pulse_peaks_g | array of numbers | Recorded valid pulse statistics |
+| reference_compatible | boolean | Reference/speed gate, not full recovery eligibility |
+| step_mm, total_mm | number | Applied offset increments, mm |
+| attempts | integer | Consecutive recovery attempts |
+| before_z_score, after_z_score, improvement | number/null | Normalized metrics, may be null or outside 0–1 |
+
+Snapshot is generated in the host fault callback, not at the precise sensor threshold timestamp; it can include samples later than the triggering sample. Window summaries have a separate 32-entry retention, not necessarily the same 30 s. Do not correlate host and MCU clocks by subtraction. Observers must be nonblocking; no network, disk or actuation in native event listeners. Monitor's signed delivery is separate. A FAILED state may occur without recovery_failed.
+
+[Complete synthetic fixture](examples/jam-event.json) for integration testing (no physical fault or actual recorded data).

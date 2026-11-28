@@ -16,3 +16,5 @@ English | [简体中文](TROUBLESHOOTING.zh-CN.md) · [Home](../README.md)
 | Force trace short | actual sensor stream, 40,000-point memory cap, window resets; not full ADC export |
 
 Collect FILAMENT_FORCE_QUERY, klippy.log and configuration before changing thresholds. Debug logs: FILAMENT_FORCE_SET DEBUG_LOG=1. Do not disable hard protection to investigate.
+
+A cold-start or reset history is not independently healthy. Preserve existing data until the fault is understood; see [commissioning](USER_GUIDE.md#advanced-calibration-and-false-alarms).
