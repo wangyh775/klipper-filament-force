@@ -278,7 +278,7 @@ def test_manual_recovery_preparation_failure_keeps_pending_reason(
     legacy_hook.side_effect = RuntimeError("recover macro failed")
     command = Mock()
     command.get.return_value = None
-    command.error.side_effect = RuntimeError
+    command.error.side_effect = lambda message: RuntimeError(message)
     with pytest.raises(RuntimeError, match="manual recovery failed"):
         monitor.cmd_FILAMENT_FORCE_RESUME(command)
     assert monitor.actions.pending_recheck and monitor.actions.pending_reason == "jam"
