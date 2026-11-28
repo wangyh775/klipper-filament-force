@@ -125,72 +125,58 @@ snapshot, acknowledging success only after the write finishes. A write
 failure or timeout is reported; do not assume reset survived power loss.
 Back up the JSON file before manual edits.
 
-## Custom jam action
+## Unified JAM actions and free-air diagnosis (experimental)
 
-On a learned-band JAM trip, the plugin runs `FILAMENT_FORCE_JAM_ACTION`.
-The built-in action runs `PAUSE` and `M400`. Define a macro with the same
-name in your printer config to override that action. No `rename_existing`
-setting is needed. For example, this action reports the measured force and
-chooses to pause:
+Both learned-band and hard-force JAM trips now pause before invoking the
+same preparation strategy. A restored-model mismatch may also be diagnosed,
+but cannot auto-resume until the model is trusted. Runout still pauses
+independently. See [recovery design](docs/diagnostic-recovery.md).
 
-```ini
-[gcode_macro FILAMENT_FORCE_JAM_ACTION]
-gcode:
-    RESPOND MSG="Filament force jam on T{params.TOOL}, {params.FORCE_G}g"
-    PAUSE
-```
+- `FILAMENT_FORCE_JAM_ACTION`: pre-diagnosis preparation. The core pauses
+  and waits first. Override this macro to park safely and collect waste.
+  It receives TOOL, FORCE_G, TARGET, FIRST_LAYER, SOURCE and E_SPEED.
+  The default adds no movement. If a legacy override calls PAUSE itself,
+  remove that redundant call and validate its park path.
+- `FILAMENT_FORCE_CONFIRMED_JAM_ACTION`: repeatably high free-air resistance.
+  Receives the same incident metadata and DIAG_MEAN_G, DIAG_PEAK_G, RESULT.
+  Defaults to a message while paused; never resume from this strategy.
 
-The macro receives `TOOL`, `FORCE_G`, `TARGET` (the original nozzle target
-in Celsius), and `FIRST_LAYER` (`1` when layer 1 was confirmed, otherwise
-`0`). The plugin keeps its fault context if the macro pauses the print.
-If the macro leaves the print running, monitoring continues and can trip
-again. If the macro raises an error while the job is still printing, the
-plugin falls back to `PAUSE`. A custom action calling `PAUSE` controls
-whether it also needs `M400` for any moves it issues.
-
-The optional `jam_gcode` hook still runs ahead of the action. Absolute-force
-trips, model-validation trips, and runout trips use the normal pause path.
-
-## Supervised free-air diagnosis (experimental)
-
-After an ordinary learned-band JAM pause, the operator may verify that
-the nozzle is safely parked in free air, that the extruder is hot at the
-original target, and that extrusion can be safely collected. Enable
-`diagnostic_enabled: True` and set a measured safe
-`diagnostic_force_limit` (grams) below the hardware's safe force.
-The default is disabled and zero limit refuses the test. Run:
+Enable `diagnostic_enabled: True` and configure a measured safe
+`diagnostic_force_limit` (grams) below hardware limits. Manually park and run:
 
 ```gcode
 FILAMENT_FORCE_DIAGNOSE CLEARANCE=1
 ```
 
-The command never moves XYZ, heats a cold extruder, bypasses extrusion
-temperature protection, or automatically resumes. It only runs once per
-statistical JAM pause, not after absolute-force, model-validation or
-runout trips. It takes a fresh idle reference then performs 2–3 forward
-pulses, default 0.5 mm at 1 mm/s (total 1.5 mm). No pulse exceeds 1 mm.
-If the measured peak reaches the configured cap or the existing hard
-force threshold, whichever is lower, no subsequent pulse is issued.
-This is NOT an immediate MCU interlock: the in-flight pulse can complete,
-and sensor/communication latency applies. Keep the operator present.
-No diagnostic samples enter the learned printing model.
+For optional automatic diagnosis set `diagnostic_auto: True` and have the
+preparation macro issue `FILAMENT_FORCE_DIAG_READY CLEARANCE=1` only after
+a verified safe park and M400. Do not add an unconditional clearance
+acknowledgment. The default macro deliberately cannot authorize motion.
 
-Set `diagnostic_force_min` and `diagnostic_force_max` from independently
-measured healthy free-air pulses at the same temperature, material,
-speed, and pulse length; until calibrated the result is inconclusive
-even if all pulses complete. Results: flow_compatible (all pulse means
-within calibrated range), restriction_suspected (all above), low_force
-(all below), force_limit, or inconclusive (mixed or insufficient data).
-Normal free-air force is NOT proof of actual material flow or bed contact:
-visually confirm extrusion. A flow-compatible result after a documented
-first-layer trip sets diagnostic_contact_possible, not a Z correction.
+Diagnosis reuses the learned printing speed bin's band, or manually
+configured min/max if no usable band exists. The normal-model path is
+required for automatic recovery. By default speed tracks the triggering
+E speed within 0.5–2 mm/s. Pulse length is at least 0.5 seconds of motion
+and no more than 1 mm; 2–3 pulses. A speed mismatch greater than 20%
+or a different bin forbids auto-resume; high resistance may still be
+reported at a lower test speed. A force cap stops further pulses, not an
+already queued move. Low, mixed, missing data or force-cap results stay
+paused. Healthy force is not proof of actual extrusion.
 
-The module exposes diagnostic_result, diagnostic_pulse_means_g,
-diagnostic_pulse_peaks_g, diagnostic_extruded_mm and
-diagnostic_contact_possible through Moonraker. The original pause remains
-in effect; clear the fault and use the existing manual resume path.
-Automatic Z compensation remains forcibly disabled pending real-machine
-validation and independent feedback.
+Automatic recovery is separately opt-in (`auto_resume_enabled: True`),
+requires a tested explicit `resume_gcode` calling the underlying resume
+path, a known layer, a validated matching reference, and the same tool
+and temperature. The manual command remains diagnostic-only unless
+`RECOVER=1` is explicitly passed. The first-layer gate is separately
+controlled by `first_layer_z_enabled`. Non-first-layer recovery does
+not adjust Z. Limit automatic attempts; verify subsequent extrusion
+windows without updating the normal model.
+
+Monitor `recovery_state`, `recovery_attempts`, `recovery_healthy_windows`,
+`recovery_failure`, `recovery_last_z_score`, and existing diagnostic
+fields via Moonraker or `FILAMENT_FORCE_QUERY`. No unattended use until
+the specific printer's pause/park/resume, load-cell response, clearance
+and offset direction have been validated.
 
 ## Toolchanger
 
@@ -241,57 +227,33 @@ If your `RESUME` wrapper does extra work:
 
 ## Experimental first-layer Z correction (opt-in)
 
-The first-layer Z correction is **disabled by default**. Enable it only after
-reviewing the hardware and testing with supervised, low-risk prints. It is a
-bounded recovery attempt for a *learned-band HIGH force event*, **not**
-a reliable classifier of nozzle-too-close versus genuine filament clogging.
-Absolute `oh_shit_force` trips and filament runout continue to pause.
+With diagnostic and automatic recovery enabled, a normal matched
+free-air diagnosis on explicit slicer layer 1 (and homed valid Z)
+can authorize one positive gap increment. Default 0.02 mm, at most
+three steps and 0.06 mm total. The plugin shifts a compatible Kalico
+`PAUSE_STATE` Z coordinate, base position and homing origin together,
+rather than issuing an offset which the subsequent RESUME would undo.
+This depends on the Kalico saved-state implementation and a tested
+resume template that restores PAUSE_STATE; do not enable with an
+incompatible custom resume path. Check the offset sign and bed mesh
+on the actual machine. The plugin checks the restored origin after
+resume and pauses on mismatch.
 
-Configuration under `[filament_force]`:
+The next valid printing windows are compared to the unchanged learned
+reference. Default: two healthy windows for first-layer correction,
+three for ordinary resume, with a 60 s verification timeout. A repeated
+HIGH can permit another diagnosis only with remaining budget and
+(for first layer) at least 15% reduction in normalized high-force
+deviation; a hard-force peak is not directly comparable to a window
+mean, so a hard-trip recovery cannot infer a repeat-adjustment improvement.
+A failed verification stays paused. No automatic PA changes.
 
-```ini
-first_layer_z_enabled: False
-first_layer_z_step: 0.02
-first_layer_z_max_adjustments: 3
-first_layer_z_cooldown_s: 10.0
-first_layer_z_max_height: 0.60
-first_layer_z_max_force: 2000.0
-```
-
-**First-layer detection is fail-closed.** The slicer must explicitly report
-layer 1 using `SET_PRINT_STATS_INFO CURRENT_LAYER=1`; the printer must be
-actively printing, Z homed, and its reported G-code Z height between 0 and
-`first_layer_z_max_height`. Missing or ambiguous layer information means
-the original jam-pause behavior remains in effect. Do not use layer 0 as a
-synonym for the first layer. Check slicer start/layer-change G-code first.
-
-**Safety hold:** automatic Z correction is currently forcibly disabled, even if
-configured True, until independent diagnosis and feedback are implemented.
-The following describes the intended experimental behavior, not active behavior.
-
-Upon a confirmed *statistical* HIGH trip (three bad extrusion windows by
-default), and only if its measured force is below
-`first_layer_z_max_force` and the independent `oh_shit_force`, the module
-sends `SET_GCODE_OFFSET Z_ADJUST=+step` without an immediate extra Z move.
-It counts the adjustment, enforces cooldown, and checks again through normal
-force windows. If safety gates fail or adjustments are exhausted, original
-jam pause behavior applies. The total correction is reversed when the
-print-completion, cancellation, error, or new-file reset event fires,
-using `SET_GCODE_OFFSET Z_ADJUST=-total` without moving the axes.
-
-Verify with `FILAMENT_FORCE_QUERY`:
-`first_layer_z=on adjustments=1/3 total=0.020mm`. Corresponding
-`printer.filament_force` fields are available through Moonraker:
-`first_layer_z_enabled`, `first_layer_z_adjustments`,
-`first_layer_z_total_mm`, `first_layer_z_max_adjustments`.
-
-**Limitations:** No vision or independent nozzle/contact classification;
-the filter is based on a force anomaly. A real jam during layer 1 may
-temporarily receive a Z increase before the ordinary jam safeguard fires.
-The existing hard-force interlock is never bypassed. G-code offsets are
-session-scoped and rely on successful terminal callbacks for automatic
-undo; if the firmware crashes mid-job, inspect/reset the offset before
-printing again. Validate the sign on your machine's motion configuration.
+A job owns only its applied Z increments. Terminal callbacks attempt
+to subtract the owned correction only when the observed origin still
+matches and no new job has started; otherwise a manual-check message
+is issued. Confirm the offset after a cancelled or failed print. A
+firmware crash cannot guarantee cleanup. This is experimental and not
+yet validated on hardware.
 
 ## Spike check
 
