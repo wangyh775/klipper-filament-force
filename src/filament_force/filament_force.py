@@ -36,6 +36,7 @@ from .force_signal import BandResult, TripKind, is_short_bead, oh_shit_from_jam_
 from .pause import MonitorActions, MonitorTemplate
 from .first_layer import FirstLayerZControl
 from .model_store import ModelStore, snapshot
+from .free_air import Diagnosis, FreeAirDiagnostic
 
 if TYPE_CHECKING:
     from klippy.configfile import ConfigWrapper
@@ -249,6 +250,21 @@ class FilamentForce:
                 "filament_force: first-layer Z disabled until independent diagnosis is available"
             )
             self.first_layer.enabled = False
+        self.diagnostic_enabled = config.getboolean("diagnostic_enabled", False)
+        self.diagnostic_limit = config.getfloat("diagnostic_force_limit", 0.0, minval=0.0)
+        self.diagnostic_low = config.getfloat("diagnostic_force_min", 0.0, minval=0.0)
+        self.diagnostic_high = config.getfloat("diagnostic_force_max", 0.0, minval=0.0)
+        self.diagnostic_speed = config.getfloat("diagnostic_speed", 1.0, minval=0.5, maxval=2.0)
+        self.diagnostic_pulse = config.getfloat("diagnostic_pulse_mm", 0.5, minval=0.5, maxval=1.0)
+        self.diagnostic_count = config.getint("diagnostic_pulses", 3, minval=2, maxval=3)
+        self.diagnostic_baseline_span = config.getfloat("diagnostic_baseline_span", 30.0, above=0.0)
+        if self.diagnostic_pulse / self.diagnostic_speed < 0.5:
+            raise config.error("filament_force: diagnostic pulse duration must be at least 0.5s")
+        self._diag = FreeAirDiagnostic()
+        self._diag_attempted = False
+        self._diag_generation = 0
+        self._diag_trip_source = ""
+        self._diag_first_layer = False
         self.sensor_name: str = config.get("sensor", "load_cell_probe")
         self.extruder_name: str = config.get("extruder", "extruder")
         self.continuous_detection: bool = config.getboolean(
@@ -381,6 +397,10 @@ class FilamentForce:
             "FILAMENT_FORCE_SET",
             self.cmd_FILAMENT_FORCE_SET,
             desc=self.cmd_FILAMENT_FORCE_SET_help,
+        )
+        self.gcode.register_command(
+            "FILAMENT_FORCE_DIAGNOSE", self.cmd_FILAMENT_FORCE_DIAGNOSE,
+            desc=self.cmd_FILAMENT_FORCE_DIAGNOSE_help,
         )
         self.gcode.register_command(
             "FILAMENT_FORCE_QUERY",
@@ -601,6 +621,12 @@ class FilamentForce:
     def _handle_job_reset(self, *args: object) -> None:
         """Undo only offsets owned by this module when a job ends/resets."""
         del args
+        self._diag_generation += 1
+        if self._diag.active:
+            self._diag.abort()
+        self._diag_attempted = False
+        self._diag_trip_source = ""
+        self._diag_first_layer = False
         applied = self.first_layer.applied_mm
         self.first_layer.reset()
         if applied:
@@ -712,7 +738,7 @@ class FilamentForce:
     def _arm(self) -> None:
         # G1 E from CHECK_SPIKE / CAL_OH_SHIT trips idle_timeout:printing.
         # Arming here would abort the routine that caused the motion.
-        if self._cal.active or self._spike.active:
+        if self._cal.active or self._spike.active or self._diag.active:
             return
         if self._armed or self._load_cell is None or self._poll_timer is None:
             return
@@ -756,6 +782,10 @@ class FilamentForce:
             self.reactor.update_timer(self._poll_timer, self.reactor.NEVER)
 
     def _force_client(self, msg: object) -> bool:
+        if self._diag.active:
+            for sample in force_signal.iter_load_cell_samples(msg):
+                self._diag.note(sample)
+            return True
         in_probe = self._spike.active or self._cal.active
         if not self._armed and not in_probe:
             return True
@@ -856,6 +886,7 @@ class FilamentForce:
             or self._triggering
             or self._spike.active
             or self._cal.active
+            or self._diag.active
             or self.actions.pending_recheck
         ):
             return next_time
@@ -1295,6 +1326,137 @@ class FilamentForce:
             f"(peak {peak:.0f}g). SAVE_CONFIG to keep it."
         )
 
+
+    cmd_FILAMENT_FORCE_DIAGNOSE_help = (
+        "Supervised free-air test after a statistical jam pause; "
+        "FILAMENT_FORCE_DIAGNOSE CLEARANCE=1"
+    )
+
+    def _diagnostic_ready(self, generation: int) -> bool:
+        if (
+            generation != self._diag_generation
+            or self.actions.print_stats_state() != "paused"
+            or not self.actions.pending_recheck
+            or self.actions.pending_reason != "jam"
+            or self.actions.pending_tool != self.active_tool
+            or self.suppress
+            or self._extruder is None
+        ):
+            return False
+        pause = self.printer.lookup_object("pause_resume", None)
+        toolhead = self.printer.lookup_object("toolhead", None)
+        if pause is None or toolhead is None:
+            return False
+        now = self.reactor.monotonic()
+        if not pause.get_status(now).get("is_paused"):
+            return False
+        if toolhead.get_extruder() is not self._extruder:
+            return False
+        heater = self._extruder.get_heater()
+        status = heater.get_status(now)
+        temp = float(status.get("temperature", 0.0))
+        target = float(status.get("target", 0.0))
+        original = self.actions.pending_target
+        return (
+            bool(heater.can_extrude) and math.isfinite(temp)
+            and math.isfinite(target) and math.isfinite(original)
+            and original > 0 and target > 0
+            and abs(target - original) <= 10.0 and abs(temp - original) <= 10.0
+        )
+
+    def cmd_FILAMENT_FORCE_DIAGNOSE(self, gcmd: GCodeCommand) -> None:
+        if not self.diagnostic_enabled:
+            raise gcmd.error("filament_force: free-air diagnosis disabled")
+        if gcmd.get_int("CLEARANCE", 0, minval=0, maxval=1) != 1:
+            raise gcmd.error("Confirm nozzle is parked safely in free air: CLEARANCE=1")
+        if (
+            self._diag.active or self._diag_attempted or self._triggering
+            or self._spike.active or self._cal.active or self._load_cell is None
+            or self._estimated_print_time is None
+            or self._diag_trip_source != "band"
+        ):
+            raise gcmd.error("filament_force: diagnosis unavailable or already attempted")
+        limit = min(self.diagnostic_limit, self.oh_shit_force)
+        if not math.isfinite(limit) or not 0 < limit:
+            raise gcmd.error("Configure a calibrated diagnostic_force_limit first")
+        generation = self._diag_generation
+        if not self._diagnostic_ready(generation):
+            raise gcmd.error("Requires paused jam, same active tool and original hotend temperature")
+        toolhead = self.printer.lookup_object("toolhead")
+        if not self._client_attached:
+            self._load_cell.add_client(self._force_client)
+            self._client_attached = True
+        self._diag_attempted = True
+        d = self._diag
+        d.begin(limit)
+        saved = False
+        try:
+            self.gcode.run_script_from_command("M400")
+            self.gcode.run_script_from_command(
+                "SAVE_GCODE_STATE NAME=_FF_DIAG_STATE\nM83"
+            )
+            saved = True
+            start = self._estimated_print_time(self.reactor.monotonic())
+            d.capture(start)
+            self.reactor.pause(self.reactor.monotonic() + 0.8)
+            end = self._estimated_print_time(self.reactor.monotonic())
+            if not d.set_reference(start, end, self.diagnostic_baseline_span):
+                raise gcmd.error("Unstable or missing idle force samples")
+            for _ in range(self.diagnostic_count):
+                if not d.active or d.limit_hit or not self._diagnostic_ready(generation):
+                    break
+                start = toolhead.get_last_move_time()
+                d.capture(start)
+                self.gcode.run_script_from_command(
+                    f"G1 E{self.diagnostic_pulse:.3f} F{self.diagnostic_speed * 60:.3f}"
+                )
+                d.extruded_mm += self.diagnostic_pulse
+                end = toolhead.get_last_move_time()
+                self.gcode.run_script_from_command("M400")
+                self.reactor.pause(self.reactor.monotonic() + 0.3)
+                if not d.active or not self._diagnostic_ready(generation):
+                    break
+                if d.limit_hit:
+                    break
+                # Last nominal duration lies within the queued move, avoiding
+                # any gap inserted by the toolhead when restarting from idle.
+                start = max(start, end - self.diagnostic_pulse / self.diagnostic_speed)
+                if not d.record_pulse(start, end):
+                    break
+            if not d.active or not self._diagnostic_ready(generation):
+                d.abort()
+            else:
+                d.finish(
+                    expected_pulses=self.diagnostic_count,
+                    low_g=self.diagnostic_low, high_g=self.diagnostic_high,
+                )
+        except Exception:
+            d.abort()
+            logging.exception("filament_force free-air diagnosis failed")
+            raise
+        finally:
+            if saved and generation == self._diag_generation and self.actions.print_stats_state() == "paused":
+                self.gcode.run_script_from_command("RESTORE_GCODE_STATE NAME=_FF_DIAG_STATE MOVE=0")
+            self._window.reset()
+            self._unlock_baseline()
+            self._last_e_pos = None
+            self._last_e_time = None
+        means = ",".join(f"{p.mean_g:.1f}" for p in d.pulses) or "-"
+        peaks = ",".join(f"{p.peak_g:.1f}" for p in d.pulses) or "-"
+        contact_possible = (
+            d.result is Diagnosis.FLOW_COMPATIBLE and self._diag_first_layer
+        )
+        msg = (
+            f"filament_force free-air: {d.result.value}; mean_g={means}; "
+            f"peak_g={peaks}; extruded_mm={d.extruded_mm:.2f}; "
+            f"first_layer_contact_possible={int(contact_possible)}; "
+            "paused, inspect extrudate and resolve manually"
+        )
+        logging.info(msg)
+        self.last_msg = msg
+        gcmd.respond_info(msg)
+
+
     def _trip(
         self, kind: TripKind, detail: str,
         *, source: str = "hard", force_g: float = 0.0,
@@ -1319,6 +1481,23 @@ class FilamentForce:
             tool = self.active_tool
             target = self.actions.extruder_target()
             self.last_trip = kind
+            self._diag_attempted = False
+            self._diag = FreeAirDiagnostic()
+            self._diag_trip_source = source
+            self._diag_first_layer = False
+            if kind is TripKind.JAM and source == "band":
+                try:
+                    stats_obj = self.printer.lookup_object("print_stats", None)
+                    if stats_obj is not None:
+                        layer = (stats_obj.get_status(self.reactor.monotonic()).get("info") or {}).get("current_layer")
+                        z, homed = self._first_layer_z_position()
+                        self._diag_first_layer = (
+                            type(layer) is int and layer == 1 and homed
+                            and z is not None and math.isfinite(z)
+                            and 0 <= z <= self.first_layer.max_height_mm
+                        )
+                except Exception:
+                    logging.exception("filament_force: could not capture trip layer")
             self.last_msg = f"filament_force {kind.value} ({detail})"
             template_key = (
                 MonitorTemplate.RUNOUT
@@ -1367,6 +1546,15 @@ class FilamentForce:
             high_bound = band.high_bound
             last_z = hist.last_z_score
         return {
+            "diagnostic_enabled": int(self.diagnostic_enabled),
+            "diagnostic_active": int(self._diag.active),
+            "diagnostic_result": self._diag.result.value,
+            "diagnostic_pulse_means_g": [p.mean_g for p in self._diag.pulses],
+            "diagnostic_pulse_peaks_g": [p.peak_g for p in self._diag.pulses],
+            "diagnostic_extruded_mm": self._diag.extruded_mm,
+            "diagnostic_contact_possible": int(
+                self._diag.result is Diagnosis.FLOW_COMPATIBLE and self._diag_first_layer
+            ),
             "model_pending_validation": len(self._restored_bins),
             "model_uncertain": sum(v < 0 for v in self._restored_bins.values()),
             "first_layer_z_enabled": int(self.first_layer.enabled),
@@ -1630,6 +1818,8 @@ class FilamentForce:
     )
 
     def cmd_FILAMENT_FORCE_SET_TOOL(self, gcmd: GCodeCommand) -> None:
+        if self._diag.active:
+            raise gcmd.error("filament_force: diagnosis still running")
         tool = gcmd.get_int("TOOL")
         self.active_tool = tool
         self._window.reset()
@@ -1653,6 +1843,8 @@ class FilamentForce:
     )
 
     def cmd_FILAMENT_FORCE_RESET(self, gcmd: GCodeCommand) -> None:
+        if self._diag.active:
+            raise gcmd.error("filament_force: diagnosis still running")
         tool = gcmd.get_int("TOOL", self.active_tool)
         book = self._book_for(tool)
         book.reset()
@@ -1683,6 +1875,8 @@ class FilamentForce:
     )
 
     def cmd_FILAMENT_FORCE_RESUME(self, gcmd: GCodeCommand) -> None:
+        if self._diag.active:
+            raise gcmd.error("filament_force: diagnosis still running")
         velocity = gcmd.get("VELOCITY", None)
         if not self.actions.pending_recheck:
             if self.actions.in_print_job():

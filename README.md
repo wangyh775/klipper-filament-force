@@ -102,6 +102,47 @@ snapshot, acknowledging success only after the write finishes. A write
 failure or timeout is reported; do not assume reset survived power loss.
 Back up the JSON file before manual edits.
 
+## Supervised free-air diagnosis (experimental)
+
+After an ordinary learned-band JAM pause, the operator may verify that
+the nozzle is safely parked in free air, that the extruder is hot at the
+original target, and that extrusion can be safely collected. Enable
+`diagnostic_enabled: True` and set a measured safe
+`diagnostic_force_limit` (grams) below the hardware's safe force.
+The default is disabled and zero limit refuses the test. Run:
+
+```gcode
+FILAMENT_FORCE_DIAGNOSE CLEARANCE=1
+```
+
+The command never moves XYZ, heats a cold extruder, bypasses extrusion
+temperature protection, or automatically resumes. It only runs once per
+statistical JAM pause, not after absolute-force, model-validation or
+runout trips. It takes a fresh idle reference then performs 2–3 forward
+pulses, default 0.5 mm at 1 mm/s (total 1.5 mm). No pulse exceeds 1 mm.
+If the measured peak reaches the configured cap or the existing hard
+force threshold, whichever is lower, no subsequent pulse is issued.
+This is NOT an immediate MCU interlock: the in-flight pulse can complete,
+and sensor/communication latency applies. Keep the operator present.
+No diagnostic samples enter the learned printing model.
+
+Set `diagnostic_force_min` and `diagnostic_force_max` from independently
+measured healthy free-air pulses at the same temperature, material,
+speed, and pulse length; until calibrated the result is inconclusive
+even if all pulses complete. Results: flow_compatible (all pulse means
+within calibrated range), restriction_suspected (all above), low_force
+(all below), force_limit, or inconclusive (mixed or insufficient data).
+Normal free-air force is NOT proof of actual material flow or bed contact:
+visually confirm extrusion. A flow-compatible result after a documented
+first-layer trip sets diagnostic_contact_possible, not a Z correction.
+
+The module exposes diagnostic_result, diagnostic_pulse_means_g,
+diagnostic_pulse_peaks_g, diagnostic_extruded_mm and
+diagnostic_contact_possible through Moonraker. The original pause remains
+in effect; clear the fault and use the existing manual resume path.
+Automatic Z compensation remains forcibly disabled pending real-machine
+validation and independent feedback.
+
 ## Toolchanger
 
 Call two hooks from your park and pickup macros. The extra does not patch
