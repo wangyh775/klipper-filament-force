@@ -252,7 +252,7 @@ class FilamentForce:
         )
         self.diagnostic_enabled = config.getboolean("diagnostic_enabled", False)
         self.diagnostic_auto = config.getboolean("diagnostic_auto", False)
-        self.diagnostic_match_speed = config.getboolean("diagnostic_match_speed", True)
+        self.diagnostic_match_speed = config.getboolean("diagnostic_match_speed", False)
         self.auto_resume_enabled = config.getboolean("auto_resume_enabled", False)
         self.auto_resume_max_attempts = config.getint("auto_resume_max_attempts", 2, minval=1, maxval=5)
         self.auto_resume_verify_windows = config.getint("auto_resume_verify_windows", 3, minval=1)
@@ -271,12 +271,12 @@ class FilamentForce:
         self.diagnostic_limit = config.getfloat("diagnostic_force_limit", 0.0, minval=0.0)
         self.diagnostic_low = config.getfloat("diagnostic_force_min", 0.0, minval=0.0)
         self.diagnostic_high = config.getfloat("diagnostic_force_max", 0.0, minval=0.0)
-        self.diagnostic_speed = config.getfloat("diagnostic_speed", 1.0, minval=0.5, maxval=2.0)
-        self.diagnostic_pulse = config.getfloat("diagnostic_pulse_mm", 0.5, minval=0.5, maxval=1.0)
+        self.diagnostic_speed = config.getfloat("diagnostic_speed", 3.0, minval=0.5, maxval=6.0)
+        self.diagnostic_pulse = config.getfloat("diagnostic_pulse_mm", 0.5, minval=0.5, maxval=3.0)
         self.diagnostic_count = config.getint("diagnostic_pulses", 3, minval=2, maxval=3)
         self.diagnostic_baseline_span = config.getfloat("diagnostic_baseline_span", 30.0, above=0.0)
-        if self.diagnostic_pulse / self.diagnostic_speed < 0.5:
-            raise config.error("filament_force: diagnostic pulse duration must be at least 0.5s")
+        # diagnostic_pulse_mm is a minimum length; actual pulses also cover
+        # at least 0.5s at the selected speed (maximum 3 mm).
         self._diag = FreeAirDiagnostic()
         self._diag_attempted = False
         self._diag_generation = 0
@@ -1536,7 +1536,7 @@ class FilamentForce:
         self._recovery.state = RecoveryState.DIAGNOSING
         speed = self.diagnostic_speed
         if self.diagnostic_match_speed and self._incident_speed > 0:
-            speed = min(2.0, max(0.5, self._incident_speed))
+            speed = min(self.diagnostic_speed, max(0.5, self._incident_speed))
         pulse = max(self.diagnostic_pulse, speed * 0.5)
         book = self._book_for(self.active_tool)
         ref = self._force_reference(book, force_signal.speed_bin_index(speed, self.speed_bin_edges))
@@ -2026,6 +2026,8 @@ class FilamentForce:
             "recovery_healthy_windows": self._recovery.healthy,
             "recovery_failure": self._recovery.failure,
             "recovery_last_z_score": self._recovery.last_z,
+            "diagnostic_speed": self.diagnostic_speed,
+            "diagnostic_match_speed": int(self.diagnostic_match_speed),
             "diagnostic_enabled": int(self.diagnostic_enabled),
             "diagnostic_active": int(self._diag.active),
             "diagnostic_result": self._diag.result.value,
