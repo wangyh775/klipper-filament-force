@@ -46,6 +46,9 @@ if TYPE_CHECKING:
     from klippy.reactor import SelectReactor
 
 
+_JAM_ACTION = "FILAMENT_FORCE_JAM_ACTION"
+
+
 def _resolve_load_cell(sensor: object) -> LoadCell:
     """Return the LoadCell that streams force via add_client.
 
@@ -398,6 +401,7 @@ class FilamentForce:
             "idle_timeout:idle", self._handle_not_printing
         )
 
+        self._register_jam_action(config)
         self.gcode.register_command(
             "FILAMENT_FORCE_SET",
             self.cmd_FILAMENT_FORCE_SET,
@@ -752,7 +756,7 @@ class FilamentForce:
         if raw_g >= self.oh_shit_force:
             return False
         try:
-            self.gcode.run_script(
+            self.gcode.run_script_from_command(
                 f"SET_GCODE_OFFSET Z_ADJUST={ctl.step_mm:.6f}"
             )
         except Exception:
@@ -1565,12 +1569,75 @@ class FilamentForce:
         gcmd.respond_info(msg)
 
 
+    def _register_jam_action(self, config: ConfigWrapper) -> None:
+        self._custom_jam_action = any(
+            section.get_name().split()[-1].upper() == _JAM_ACTION
+            for section in config.get_prefix_sections("gcode_macro ")
+        )
+        if not self._custom_jam_action:
+            self.gcode.register_command(_JAM_ACTION, self._default_jam_action)
+
+    def _default_jam_action(self, _gcmd: GCodeCommand) -> None:
+        """Pause after a learned-band filament jam."""
+        self.gcode.run_script_from_command("PAUSE\nM400")
+
+    def _jam_action_paused(self) -> bool:
+        state = self.actions.print_stats_state()
+        if state == "paused":
+            return True
+        pause = self.printer.lookup_object("pause_resume", None)
+        return (
+            state == "printing"
+            and pause is not None
+            and bool(pause.get_status(self.reactor.monotonic()).get("is_paused"))
+        )
+
+    def _run_jam_action(self, tool: int, target: float, force_g: float) -> None:
+        self.actions.set_pending(tool=tool, target=target, reason=TripKind.JAM.value)
+        if self._custom_jam_action:
+            msg = f"{self.last_msg}. Running {_JAM_ACTION}."
+        else:
+            msg = f"{self.last_msg}. Pausing - fix filament, then RESUME."
+        self.gcode.respond_info(msg)
+        try:
+            self.gcode.run_script_from_command(
+                f"{_JAM_ACTION} TOOL={tool} FORCE_G={force_g:.3f}"
+                f" TARGET={target:.2f} FIRST_LAYER={int(self._diag_first_layer)}"
+            )
+        except Exception:
+            if not self._custom_jam_action:
+                raise
+            logging.exception("filament_force: custom jam action failed")
+            if self.actions.is_printing() and not self._jam_action_paused():
+                self.gcode.respond_info("filament_force: custom jam action failed. Pausing.")
+                self.gcode.run_script_from_command("PAUSE\nM400")
+        finally:
+            if not self._jam_action_paused():
+                # If the macro continued or ended the job, release the lockout.
+                # Do not mix macro extrusion into the next detection window.
+                self.actions.clear_pending()
+                self._window.reset()
+                self._last_e_pos = self._last_e_time = None
+
     def _trip(
         self, kind: TripKind, detail: str,
         *, source: str = "hard", force_g: float = 0.0,
     ) -> None:
         if self._triggering or self.actions.pending_recheck:
             return
+        generation = self._diag_generation
+        self._triggering = True
+        try:
+            with self.gcode.get_mutex():
+                if generation != self._diag_generation or self.actions.pending_recheck:
+                    return
+                self._handle_trip(kind, detail, source, force_g)
+        finally:
+            self._triggering = False
+
+    def _handle_trip(
+        self, kind: TripKind, detail: str, source: str, force_g: float
+    ) -> None:
         printing = self.actions.is_printing()
         if not printing and not self._test_runout:
             return
@@ -1580,38 +1647,35 @@ class FilamentForce:
                 if self._maybe_first_layer_adjust(source, force_g):
                     return
             except Exception:
-                # Fail closed: any unexpected layer/status failure must
-                # preserve the original jam pause behavior.
                 logging.exception("filament_force first-layer gate failed")
-        self._triggering = True
         self._spike.abort()
+        tool = self.active_tool
+        target = self.actions.extruder_target()
+        self.last_trip = kind
+        self._diag_attempted = False
+        self._diag = FreeAirDiagnostic()
+        self._diag_trip_source = source
+        self._diag_first_layer = False
+        if kind is TripKind.JAM and source == "band":
+            try:
+                stats_obj = self.printer.lookup_object("print_stats", None)
+                if stats_obj is not None:
+                    layer = (stats_obj.get_status(self.reactor.monotonic()).get("info") or {}).get("current_layer")
+                    z, homed = self._first_layer_z_position()
+                    self._diag_first_layer = (
+                        type(layer) is int and layer == 1 and homed
+                        and z is not None and math.isfinite(z)
+                        and 0 <= z <= self.first_layer.max_height_mm
+                    )
+            except Exception:
+                logging.exception("filament_force: could not capture trip layer")
+        self.last_msg = f"filament_force {kind.value} ({detail})"
+        template_key = (
+            MonitorTemplate.RUNOUT
+            if kind is TripKind.RUNOUT
+            else MonitorTemplate.JAM
+        )
         try:
-            tool = self.active_tool
-            target = self.actions.extruder_target()
-            self.last_trip = kind
-            self._diag_attempted = False
-            self._diag = FreeAirDiagnostic()
-            self._diag_trip_source = source
-            self._diag_first_layer = False
-            if kind is TripKind.JAM and source == "band":
-                try:
-                    stats_obj = self.printer.lookup_object("print_stats", None)
-                    if stats_obj is not None:
-                        layer = (stats_obj.get_status(self.reactor.monotonic()).get("info") or {}).get("current_layer")
-                        z, homed = self._first_layer_z_position()
-                        self._diag_first_layer = (
-                            type(layer) is int and layer == 1 and homed
-                            and z is not None and math.isfinite(z)
-                            and 0 <= z <= self.first_layer.max_height_mm
-                        )
-                except Exception:
-                    logging.exception("filament_force: could not capture trip layer")
-            self.last_msg = f"filament_force {kind.value} ({detail})"
-            template_key = (
-                MonitorTemplate.RUNOUT
-                if kind is TripKind.RUNOUT
-                else MonitorTemplate.JAM
-            )
             self.actions.run_template_if_set(
                 template_key,
                 {
@@ -1621,18 +1685,22 @@ class FilamentForce:
                     "TARGET": target,
                 },
             )
-            if printing:
+        except Exception:
+            logging.exception("filament_force: pre-action G-code hook failed")
+        if not printing:
+            self._log_info(f"{self.last_msg}. Idle test - no pause.")
+        elif self.actions.in_print_job():
+            if kind is TripKind.JAM and source == "band" and not self._jam_action_paused():
+                self._run_jam_action(tool, target, force_g)
+            else:
                 self.actions.soft_pause(
                     f"{self.last_msg}. Pausing - fix filament, then RESUME.",
                     tool=tool,
                     target=target,
                     reason=kind.value,
-                    from_command=False,
+                    from_command=True,
                 )
-            else:
-                self._log_info(f"{self.last_msg}. Idle test - no pause.")
-        finally:
-            self._triggering = False
+                self.gcode.run_script_from_command("M400")
 
     def get_status(self, eventtime: float) -> dict[str, Any]:
         del eventtime
