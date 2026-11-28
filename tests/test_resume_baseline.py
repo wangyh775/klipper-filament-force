@@ -21,7 +21,8 @@ def make_monitor(monkeypatch: pytest.MonkeyPatch, *, shift: float = 0.0,
     monkeypatch.setattr(m, "_diagnostic_ready", lambda _g: True)
     monkeypatch.setattr(m, "_extruder_pos", lambda _t: 20.0)
     th = Mock()
-    th.get_last_move_time.side_effect = [1.0, 2.0 if motion else 1.0]
+    th.check_busy.side_effect = [(1.0, 10.0, True), (2.0 if motion else 1.0, 11.0, True)]
+    th.get_position.return_value = [10.0, 20.0, 5.0, 20.0]
     printer = Mock()
     printer.lookup_object.return_value = th
     reactor = Mock()

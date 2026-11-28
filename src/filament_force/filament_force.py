@@ -1777,8 +1777,11 @@ class FilamentForce:
             raise RuntimeError("resume context changed")
         self.gcode.run_script_from_command("M400")
         toolhead = self.printer.lookup_object("toolhead")
-        queued = toolhead.get_last_move_time()
         now = self.reactor.monotonic()
+        queued, estimated, empty = toolhead.check_busy(now)
+        if not empty or queued > estimated:
+            raise RuntimeError("motion queue not drained")
+        position = tuple(toolhead.get_position())
         e_start = self._extruder_pos(now)
         start = clock(now)
         capture = FreeAirDiagnostic(max_sample_gap_s=self.diagnostic_max_sample_gap_s)
@@ -1789,9 +1792,12 @@ class FilamentForce:
         try:
             end = start + 0.8
             self.reactor.pause(now + 0.8 + 0.25)  # allow buffered sample delivery
+            now = self.reactor.monotonic()
+            later, estimated, empty = toolhead.check_busy(now)
             if (not self._diagnostic_ready(generation)
-                    or toolhead.get_last_move_time() != queued
-                    or e_start is None or self._extruder_pos(self.reactor.monotonic()) != e_start):
+                    or not empty or later > estimated or later != queued
+                    or tuple(toolhead.get_position()) != position
+                    or e_start is None or self._extruder_pos(now) != e_start):
                 raise RuntimeError("motion or context changed during baseline qualification")
             if capture.limit_hit or not capture.set_reference(start, end, self.baseline_max_span_g):
                 raise RuntimeError("unstable or missing pre-resume force baseline")
