@@ -323,3 +323,76 @@ def test_watchdog_sensor_event_links_failure(monitor: FilamentForce, gcode: Mock
     assert events[0]["window"]["samples"] == []
     assert events[1]["incident_id"] == events[0]["event_id"]
     assert monitor.actions.pending_reason == "protection"
+
+
+def test_d_fault_z_cleanup_command_exception_retains_ownership(
+    monitor: FilamentForce, gcode: Mock, stats: Mock, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stats.get_status.return_value = {"state": "complete"}
+    owned = monitor._z_ownership
+    owned.stage(.1, .12, .02)
+    owned.commit(.12)
+    owned.finish_job()
+    monkeypatch.setattr(monitor, "_current_z_origin", lambda: .12)
+    gcode.run_script_from_command.side_effect = RuntimeError("injected offset failure")
+    monitor._undo_recovery_z(monitor._diag_generation)
+    assert owned.applied_mm == .02 and owned.cleanup_pending and owned.uncertain
+
+
+def test_d_fault_observer_exception_does_not_prevent_fault_pause(
+    monitor: FilamentForce, gcode: Mock, stats: Mock, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from filament_force.events import EventJournal
+
+    monitor.event_enabled = True
+    monitor._event_journal = EventJournal()
+    monitor._incident_id = None
+    monitor._incident_filename = ""
+    cast(Mock, monitor.reactor).monotonic.return_value = 3.0
+    cast(Mock, monitor.printer).send_event.side_effect = RuntimeError("listener crash")
+    monitor._publish_event("recovery_failed", reason="injected")
+    callback = cast(Mock, monitor.reactor).register_callback.call_args.args[0]
+    callback(3.0)
+    gcode.run_script_from_command.side_effect = lambda _script: stats.get_status.configure_mock(
+        return_value={"state": "paused"}
+    )
+    assert monitor._ensure_fault_pause("injected")
+    assert monitor._event_journal.status()[0]["reason"] == "injected"
+
+
+@pytest.mark.xfail(strict=True, reason="D-F01: RESUMING suppresses watchdog even after actual print starts")
+def test_d_fault_resume_macro_continues_print_after_sensor_stops(monitor: FilamentForce) -> None:
+    monitor.enabled = True
+    monitor._sample_health = SampleHealth(last_mcu=1.0, last_host=0.0)
+    monitor.sensor_timeout_s = 2.0
+    monitor._watchdog_started = 0.0
+    monitor._protection_queued = False
+    monitor._force_ref_locked = True
+    monitor._baseline_wait_since = None
+    monitor._diag = FreeAirDiagnostic()
+    monitor._cal = OhShitCal()
+    monitor._spike.active = False
+    monitor._recovery.state = RecoveryState.RESUMING
+    monitor._protection_watchdog(3.0)
+    assert cast(Mock, monitor.reactor).register_callback.called
+
+
+@pytest.mark.xfail(strict=True, reason="D-F02: event listeners receive mutable journal objects")
+def test_d_fault_native_listener_cannot_mutate_retained_event(
+    monitor: FilamentForce,
+) -> None:
+    from filament_force.events import EventJournal
+
+    monitor.event_enabled = True
+    monitor._event_journal = EventJournal()
+    monitor._incident_id = None
+    monitor._incident_filename = ""
+    cast(Mock, monitor.reactor).monotonic.return_value = 3.0
+
+    def mutate(_name: str, payload: dict[str, object]) -> None:
+        payload["kind"] = "corrupted"
+
+    cast(Mock, monitor.printer).send_event.side_effect = mutate
+    monitor._publish_event("recovery_failed", reason="injected")
+    cast(Mock, monitor.reactor).register_callback.call_args.args[0](3.0)
+    assert monitor._event_journal.status()[0]["kind"] == "recovery_failed"

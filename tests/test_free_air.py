@@ -1,4 +1,6 @@
 """Pure regression tests for the free-air diagnostic."""
+import pytest
+
 from filament_force.free_air import Diagnosis, FreeAirDiagnostic
 from filament_force.force_signal import Sample
 
@@ -90,3 +92,24 @@ def test_duplicate_pulse_timestamps_rejected() -> None:
         d.note(Sample(2.0 + i * .05, 1070.0))
         d.note(Sample(2.0 + i * .05, 1070.0))
     assert not d.record_pulse(2.0, 3.0)
+
+
+@pytest.mark.xfail(strict=True, reason="D-F03: missing pulse onset/tail still allows healthy classification")
+def test_d_fault_missing_pulse_edges_cannot_authorize_recovery() -> None:
+    d = setup()
+    for _ in range(3):
+        d.capture(2.0)
+        # Only middle 60% delivered; onset/tail could hide an overload.
+        for i in range(21):
+            d.note(Sample(2.2 + i * .03, 1070.0))
+        if not d.record_pulse(2.0, 3.0):
+            break
+    assert d.finish(expected_pulses=3, low_g=50, high_g=100) is not Diagnosis.FLOW_COMPATIBLE
+
+
+def test_d_fault_single_peak_over_limit_overrides_healthy_means() -> None:
+    d = setup()
+    for _ in range(3):
+        pulse(d, 70.0)
+    d.note(Sample(3.1, 1250.0))
+    assert d.finish(expected_pulses=3, low_g=50, high_g=100) is Diagnosis.FORCE_LIMIT
