@@ -5,6 +5,7 @@ untrusted: reject incompatible parameters and malformed data before restoring.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -110,8 +111,12 @@ def decode(
 
 
 class ModelStore:
-    def __init__(self, filename: str) -> None:
-        self.path = Path(os.path.expanduser(filename))
+    def __init__(self, filename: str, *, profile: str = "default") -> None:
+        path = Path(os.path.expanduser(filename))
+        if profile != "default":
+            key = hashlib.sha256(profile.encode("utf-8")).hexdigest()[:24]
+            path = path.with_name(f"{path.stem}.{key}{path.suffix}")
+        self.path = path
 
     def load(
         self,
@@ -136,7 +141,9 @@ class ModelStore:
     def save(
         self, books: Mapping[int, ToolForceBook], fingerprint: dict[str, object]
     ) -> None:
-        payload = snapshot(books, fingerprint)
+        self.save_payload(snapshot(books, fingerprint))
+
+    def save_payload(self, payload: dict[str, object]) -> None:
         parent = self.path.parent
         parent.mkdir(parents=True, exist_ok=True)
         fd, tempname = tempfile.mkstemp(prefix=".filament_force_", suffix=".tmp", dir=parent)
@@ -147,6 +154,12 @@ class ModelStore:
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(tempname, self.path)
+            # Persist the directory entry as well as the file contents (Linux).
+            dir_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
         finally:
             if os.path.exists(tempname):
                 os.unlink(tempname)

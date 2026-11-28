@@ -67,13 +67,19 @@ model_save_interval: 60.0
 ```
 
 The file is written atomically (temporary file + fsync + replace). Saves are
-periodic, including during long prints, and on Klipper shutdown. Only healthy
+periodic, including during long prints, and on Klipper shutdown. Disk writes
+run in a single worker, not the reactor timer. Only healthy
 statistical windows are stored; live force, tare/reference lock, pending trips,
 and anomaly streaks are never restored.
 
-After restart, each restored speed bin and the runout history is held out of
-scoring until three consecutive windows fall within a conservative validation
-band. A mismatch discards only that restored history and returns it to learning.
+After restart, both restored references remain active for detection while
+learning is frozen. Three consecutive eligible matching windows validate a
+reference. Short beads neither validate nor learn. A mismatch retains the
+old samples, marks the reference uncertain and pauses after the configured
+confirmation count if the mismatch persists. The operator must inspect the
+cause before explicitly resetting a genuinely obsolete model. Unlearned
+partial histories are discarded at restart. A new speed bin with only a global
+reference may conservatively pause if its force differs substantially.
 A missing, malformed, incompatible, or unsupported-version file is not used;
 the plugin logs the reason and starts fresh. The independent absolute
 `oh_shit_force` interlock remains active regardless of model availability.
@@ -83,13 +89,18 @@ each materially different setup, for example
 `PEEK-400C-nozzle04-loadcellA`. Change it whenever material, nozzle diameter,
 hotend temperature range, load-cell mounting/calibration, or other
 force-affecting hardware/process conditions change. The plugin cannot infer
-filament chemistry from G-code automatically.
+filament chemistry from G-code automatically. Non-default profiles use
+separate hashed filenames alongside model_file. Earlier files with the
+incomplete sampling fingerprint are intentionally incompatible; supervise
+the first learning print after upgrading.
 
 Use `FILAMENT_FORCE_QUERY` to inspect `model_persistence`,
 `model_state`, and `pending_validation`. Set `model_persistence: False` in
 the config and restart to disable persistence. `FILAMENT_FORCE_RESET
-[TOOL=n]` clears that tool's learned history and the next save updates the
-store accordingly. Back up the JSON file before manual edits.
+[TOOL=n]` clears that tool's learned history and queues an immediate durable
+snapshot, acknowledging success only after the write finishes. A write
+failure or timeout is reported; do not assume reset survived power loss.
+Back up the JSON file before manual edits.
 
 ## Toolchanger
 
@@ -149,7 +160,7 @@ Absolute `oh_shit_force` trips and filament runout continue to pause.
 Configuration under `[filament_force]`:
 
 ```ini
-first_layer_z_enabled: True
+first_layer_z_enabled: False
 first_layer_z_step: 0.02
 first_layer_z_max_adjustments: 3
 first_layer_z_cooldown_s: 10.0
@@ -163,6 +174,10 @@ actively printing, Z homed, and its reported G-code Z height between 0 and
 `first_layer_z_max_height`. Missing or ambiguous layer information means
 the original jam-pause behavior remains in effect. Do not use layer 0 as a
 synonym for the first layer. Check slicer start/layer-change G-code first.
+
+**Safety hold:** automatic Z correction is currently forcibly disabled, even if
+configured True, until independent diagnosis and feedback are implemented.
+The following describes the intended experimental behavior, not active behavior.
 
 Upon a confirmed *statistical* HIGH trip (three bad extrusion windows by
 default), and only if its measured force is below

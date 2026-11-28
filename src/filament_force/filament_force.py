@@ -26,6 +26,8 @@
 from __future__ import annotations
 
 import logging
+import math
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
@@ -33,7 +35,7 @@ from . import force_signal
 from .force_signal import BandResult, TripKind, is_short_bead, oh_shit_from_jam_peak
 from .pause import MonitorActions, MonitorTemplate
 from .first_layer import FirstLayerZControl
-from .model_store import ModelStore
+from .model_store import ModelStore, snapshot
 
 if TYPE_CHECKING:
     from klippy.configfile import ConfigWrapper
@@ -242,6 +244,11 @@ class FilamentForce:
             max_height_mm=config.getfloat("first_layer_z_max_height", 0.60, above=0.0),
             max_force_g=config.getfloat("first_layer_z_max_force", 2000.0, above=0.0),
         )
+        if self.first_layer.enabled:
+            logging.warning(
+                "filament_force: first-layer Z disabled until independent diagnosis is available"
+            )
+            self.first_layer.enabled = False
         self.sensor_name: str = config.get("sensor", "load_cell_probe")
         self.extruder_name: str = config.get("extruder", "extruder")
         self.continuous_detection: bool = config.getboolean(
@@ -291,7 +298,9 @@ class FilamentForce:
         self.model_save_interval: float = config.getfloat(
             "model_save_interval", 60.0, above=0.0
         )
-        self.model_store = ModelStore(self.model_file)
+        self.model_store = ModelStore(self.model_file, profile=self.model_profile)
+        self._model_writer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ff-model")
+        self._model_future: Future[None] | None = None
         self._model_timer: Any | None = None
         self._model_dirty = False
         self._restored_bins: dict[tuple[int, int], int] = {}
@@ -479,6 +488,10 @@ class FilamentForce:
             "detection_length": self.detection_length,
             "min_e_speed": self.min_e_speed,
             "rolling_window": self.rolling_window,
+            "baseline_time": self.baseline_time,
+            "idle_reset_s": self.idle_reset_s,
+            "min_learn_s": self.min_learn_s,
+            "poll_interval": self.poll_interval,
             "min_delta_g": self.min_delta_g,
             "high_sigma": self.high_sigma,
             "drop_ratio": self.drop_ratio,
@@ -499,8 +512,12 @@ class FilamentForce:
                 for index, hist in enumerate(book.bins):
                     if hist.learned:
                         self._restored_bins[(tool, index)] = 0
+                    else:
+                        hist.reset()
                 if book.runout.learned:
                     self._restored_bins[(tool, -1)] = 0
+                else:
+                    book.runout.reset()
             logging.info(
                 "filament_force model_store loaded %d tool(s); bins require validation",
                 len(self.books),
@@ -511,28 +528,75 @@ class FilamentForce:
                 result.state, result.reason,
             )
 
+    def _collect_model_save(self) -> bool:
+        future = self._model_future
+        if future is None:
+            return True
+        if not future.done():
+            return False
+        self._model_future = None
+        try:
+            future.result()
+        except Exception:
+            self._model_dirty = True
+            logging.exception("filament_force model_store save failed")
+        return True
+
     def _save_model_store(self) -> None:
-        if not self.model_persistence or not self._model_dirty:
+        if not self.model_persistence:
+            return
+        if not self._collect_model_save() or not self._model_dirty:
             return
         try:
-            self.model_store.save(self.books, self._model_fingerprint())
+            # Snapshot on reactor; only the worker owns the detached payload.
+            payload = snapshot(self.books, self._model_fingerprint())
+            self._model_future = self._model_writer.submit(
+                self.model_store.save_payload, payload
+            )
             self._model_dirty = False
-            self._ff_log("model_saved", {"tools": len(self.books)})
-        except OSError:
-            logging.exception("filament_force model_store save failed")
+        except Exception:
+            logging.exception("filament_force model_store snapshot failed")
 
     def _model_save_event(self, eventtime: float) -> float:
-        if self._model_dirty:
-            self._save_model_store()
+        self._save_model_store()
         return eventtime + self.model_save_interval
 
     def _rebuild_books(self) -> None:
         self.books = {}
         self._restored_bins.clear()
+        self._window.reset()
         self._model_dirty = True
 
     def _handle_model_shutdown(self) -> None:
-        self._save_model_store()
+        if not self.model_persistence:
+            return
+        try:
+            # Serialize after any in-flight write; do not wait in the reactor.
+            payload = snapshot(self.books, self._model_fingerprint())
+            self._model_writer.submit(self.model_store.save_payload, payload)
+        except Exception:
+            logging.exception("filament_force model_store shutdown save failed")
+
+    def _persist_reset(self, gcmd: GCodeCommand) -> None:
+        if not self.model_persistence:
+            return
+        try:
+            payload = snapshot(self.books, self._model_fingerprint())
+            # FIFO with any older snapshot: an old save cannot overwrite reset.
+            future = self._model_writer.submit(self.model_store.save_payload, payload)
+            self._model_future = future
+            deadline = self.reactor.monotonic() + 5.0
+            while not future.done():
+                now = self.reactor.monotonic()
+                if now >= deadline:
+                    raise TimeoutError("model reset write still pending")
+                self.reactor.pause(min(now + 0.05, deadline))
+            future.result()
+            self._model_future = None
+        except Exception as exc:
+            self._model_dirty = True
+            logging.exception("filament_force model reset persistence failed")
+            raise gcmd.error(f"filament_force: reset not confirmed on disk: {exc}")
 
     def _handle_job_reset(self, *args: object) -> None:
         """Undo only offsets owned by this module when a job ends/resets."""
@@ -851,6 +915,8 @@ class FilamentForce:
         if completed is None:
             return next_time
         raw_g = completed.level
+        if not math.isfinite(raw_g) or not math.isfinite(completed.e_speed):
+            return next_time
         self._last_level_g = raw_g
         self._last_e_speed = completed.e_speed
         bin_i = force_signal.speed_bin_index(
@@ -866,63 +932,14 @@ class FilamentForce:
 
         book = self._book_for(self.active_tool)
         hist = book.bin_hist(bin_i)
-        restored_key = (self.active_tool if self.active_tool >= 0 else -1, bin_i)
-        if restored_key in self._restored_bins and hist.learned:
-            stats = hist.mean_stdev()
-            tolerance = max(3.0 * stats.stdev, self.min_delta_g, 0.15 * stats.mean)
-            if abs(raw_g - stats.mean) <= tolerance:
-                self._restored_bins[restored_key] += 1
-                if self._restored_bins[restored_key] < 3:
-                    self._ff_log("model_validate", {
-                        "tool": self.active_tool, "bin": bin_i,
-                        "streak": self._restored_bins[restored_key],
-                        "result": "within_band",
-                    })
-                    return next_time
-                del self._restored_bins[restored_key]
-                logging.info(
-                    "filament_force restored model validated T%d bin %d",
-                    self.active_tool, bin_i,
-                )
-                return next_time
-            hist.reset()
-            self._restored_bins.pop(restored_key, None)
-            self._model_dirty = True
-            logging.warning(
-                "filament_force restored model rejected T%d bin %d; relearning",
-                self.active_tool, bin_i,
-            )
-            return next_time
-        runout_key = (self.active_tool if self.active_tool >= 0 else -1, -1)
-        if runout_key in self._restored_bins and book.runout.learned:
-            run_stats = book.runout.mean_stdev()
-            tolerance = max(
-                3.0 * run_stats.stdev,
-                self.min_delta_g,
-                0.15 * run_stats.mean,
-            )
-            if abs(raw_g - run_stats.mean) <= tolerance:
-                self._restored_bins[runout_key] += 1
-                if self._restored_bins[runout_key] < 3:
-                    return next_time
-                del self._restored_bins[runout_key]
-                logging.info(
-                    "filament_force restored runout model validated T%d",
-                    self.active_tool,
-                )
-                return next_time
-            book.runout.reset()
-            self._restored_bins.pop(runout_key, None)
-            self._model_dirty = True
-            logging.warning(
-                "filament_force restored runout model rejected T%d; relearning",
-                self.active_tool,
-            )
-            return next_time
-        trip = book.observe(
-            raw_g,
-            completed.e_speed,
-            self.speed_bin_edges,
+        tool_key = self.active_tool if self.active_tool >= 0 else -1
+        validating = (
+            (tool_key, bin_i) in self._restored_bins
+            or (tool_key, -1) in self._restored_bins
+        )
+        trip = force_signal.observe_restored(
+            book, self._restored_bins, tool_key,
+            raw_g, completed.e_speed, self.speed_bin_edges,
             short_bead=short_bead,
             high_sigma=self.high_sigma,
             min_delta_g=self.min_delta_g,
@@ -932,6 +949,12 @@ class FilamentForce:
             runout_max_level_g=self.runout_max_level_g,
             trip_high=self.sigma_jam,
         )
+        if validating and not short_bead:
+            self._ff_log("model_validate", {
+                "tool": tool_key, "bin": bin_i,
+                "pending": len(self._restored_bins),
+                "uncertain": sum(v < 0 for v in self._restored_bins.values()),
+            })
         stats = hist.mean_stdev()
         skip_s = "short_bead" if short_bead else "-"
         if short_bead:
@@ -1002,9 +1025,10 @@ class FilamentForce:
             )
         )
         detail = f"{raw_g:.0f}g"
+        source = "model_validation" if validating else "band"
         self.reactor.register_callback(
-            lambda et, k=trip_kind, d=detail, raw=raw_g: self._trip(
-                k, d, source="band", force_g=raw
+            lambda et, k=trip_kind, d=detail, raw=raw_g, src=source: self._trip(
+                k, d, source=src, force_g=raw
             )
         )
         return next_time
@@ -1343,6 +1367,8 @@ class FilamentForce:
             high_bound = band.high_bound
             last_z = hist.last_z_score
         return {
+            "model_pending_validation": len(self._restored_bins),
+            "model_uncertain": sum(v < 0 for v in self._restored_bins.values()),
             "first_layer_z_enabled": int(self.first_layer.enabled),
             "first_layer_z_adjustments": self.first_layer.adjustments,
             "first_layer_z_total_mm": self.first_layer.applied_mm,
@@ -1394,6 +1420,7 @@ class FilamentForce:
     )
 
     def cmd_FILAMENT_FORCE_SET(self, gcmd: GCodeCommand) -> None:
+        old_sampling = (self.detection_length, self.min_e_speed, self.idle_reset_s, self.min_learn_s)
         enable = gcmd.get_int("ENABLE", None, minval=0, maxval=1)
         if enable is not None:
             self.enabled = bool(enable)
@@ -1484,8 +1511,11 @@ class FilamentForce:
         if min_learn_windows is not None:
             self.min_learn_windows = min_learn_windows
             rebuild = True
-        if rebuild:
+        if rebuild or old_sampling != (
+            self.detection_length, self.min_e_speed, self.idle_reset_s, self.min_learn_s
+        ):
             self._rebuild_books()
+            self._persist_reset(gcmd)
         # Any runtime parameter change is reflected in the persisted profile.
         self._model_dirty = True
 
@@ -1561,7 +1591,8 @@ class FilamentForce:
             f" total={self.first_layer.applied_mm:.3f}mm\n"
             f"  model_persistence={'on' if self.model_persistence else 'off'}"
             f" model_state={self._model_load_state}"
-            f" pending_validation={len(self._restored_bins)}\n"
+            f" pending_validation={len(self._restored_bins)}"
+            f" uncertain={sum(v < 0 for v in self._restored_bins.values())}\n"
             f"  enabled={'on' if self.enabled else 'off'}"
             f" armed={'yes' if self._armed else 'no'}"
             f" suppress={'yes' if self.suppress else 'no'}"
@@ -1642,6 +1673,7 @@ class FilamentForce:
         self._unlock_baseline()
         self._unretract_remaining = 0.0
         self._last_bin = 0
+        self._persist_reset(gcmd)
         gcmd.respond_info(
             f"filament_force: reset history for T{tool} (pending cleared)"
         )

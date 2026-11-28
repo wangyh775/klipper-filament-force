@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import math
 import statistics
 from collections import deque
 from collections.abc import Sequence
@@ -54,8 +55,11 @@ class Sample(NamedTuple):
     def from_raw(cls, row: object) -> Sample | None:
         try:
             cells = cast(Sequence[Any], row)
-            return cls(float(cells[0]), float(cells[1]))
-        except (TypeError, ValueError, IndexError):
+            timestamp, force = float(cells[0]), float(cells[1])
+            if not math.isfinite(timestamp) or not math.isfinite(force):
+                return None
+            return cls(timestamp, force)
+        except (TypeError, ValueError, IndexError, KeyError, OverflowError):
             return None
 
 
@@ -167,7 +171,7 @@ def normalise_speed_bin_edges(edges: Sequence[float]) -> tuple[float, ...]:
         raise ValueError("speed_bins needs at least one interior edge")
     prev = 0.0
     for edge in out:
-        if edge <= prev:
+        if not math.isfinite(edge) or edge <= prev:
             raise ValueError(
                 "speed_bins must be strictly increasing and positive"
             )
@@ -496,6 +500,7 @@ class ToolForceBook:
         drop_ratio: float = 0.35,
         runout_max_level_g: float = 80.0,
         trip_high: bool = True,
+        allow_learn: bool = True,
     ) -> AnomalyKind | None:
         """Score one raw-gram window.
 
@@ -510,9 +515,23 @@ class ToolForceBook:
         """
         bin_i = self._clamp_bin(speed_bin_index(e_speed, edges))
         self.last_bin = bin_i
-        if short_bead:
+        if short_bead or not math.isfinite(raw_g) or not math.isfinite(e_speed):
             return None
         hist = self.bins[bin_i]
+        # Evaluate both learned references before mutating either history.
+        # A fault detected by one reference must not train the other.
+        score_args = dict(
+            high_sigma=high_sigma, min_delta_g=min_delta_g,
+            drop_ratio=drop_ratio, runout_max_level_g=runout_max_level_g,
+        )
+        if hist.learned:
+            stats = hist.mean_stdev()
+            band = score_level(raw_g, stats.mean, stats.stdev, **score_args)
+            allow_learn = allow_learn and band.kind is AnomalyKind.NONE
+        if self.runout.learned:
+            stats = self.runout.mean_stdev()
+            band = score_level(raw_g, stats.mean, stats.stdev, **score_args)
+            allow_learn = allow_learn and band.kind is not AnomalyKind.LOW
         hist.observe(
             raw_g,
             high_sigma=high_sigma,
@@ -522,7 +541,7 @@ class ToolForceBook:
             drop_ratio=drop_ratio,
             runout_max_level_g=runout_max_level_g,
             trip_low=False,
-            allow_learn=True,
+            allow_learn=allow_learn,
         )
         stats = expected_force_stats(self.bins, e_speed, edges)
         high_trip: AnomalyKind | None = None
@@ -557,9 +576,102 @@ class ToolForceBook:
             drop_ratio=drop_ratio,
             runout_max_level_g=runout_max_level_g,
             trip_low=True,
-            allow_learn=True,
+            allow_learn=allow_learn,
         )
         return high_trip or low_trip
+
+
+
+def observe_restored(
+    book: ToolForceBook,
+    pending: dict[tuple[int, int], int],
+    tool: int,
+    raw_g: float,
+    e_speed: float,
+    edges: Sequence[float],
+    *,
+    short_bead: bool,
+    high_sigma: float,
+    min_delta_g: float,
+    confirm_windows: int,
+    recover_windows: int,
+    drop_ratio: float,
+    runout_max_level_g: float,
+    trip_high: bool,
+) -> AnomalyKind | None:
+    """Score restored references without allowing a mismatch to replace them.
+
+    Pending values >=0 count consecutive matching windows; negative values
+    count consecutive mismatches. Each reference validates independently.
+    A known speed bin takes precedence over the global runout mean for
+    high force; the global mean spans speeds and is not a jam baseline.
+    """
+    if short_bead or not math.isfinite(raw_g) or not math.isfinite(e_speed):
+        return None
+    index = speed_bin_index(e_speed, edges)
+    hist = book.bin_hist(index)
+    bin_key, runout_key = (tool, index), (tool, -1)
+    keys = [key for key in (bin_key, runout_key) if key in pending]
+    score_args = dict(
+        high_sigma=high_sigma, min_delta_g=min_delta_g,
+        drop_ratio=drop_ratio, runout_max_level_g=runout_max_level_g,
+    )
+    matches: dict[tuple[int, int], bool] = {}
+    if bin_key in pending:
+        stats = hist.mean_stdev()
+        tolerance = max(3.0 * stats.stdev, min_delta_g, 0.15 * stats.mean)
+        band = score_level(raw_g, stats.mean, stats.stdev, **score_args)
+        matches[bin_key] = (
+            abs(raw_g - stats.mean) <= tolerance
+            and band.kind is AnomalyKind.NONE
+        )
+    if runout_key in pending:
+        stats = book.runout.mean_stdev()
+        tolerance = max(3.0 * stats.stdev, min_delta_g, 0.15 * stats.mean)
+        band = score_level(raw_g, stats.mean, stats.stdev, **score_args)
+        # A healthy known speed bin can have a different global mean.
+        # For an unseen speed, demand a conservative global match instead.
+        if hist.learned:
+            bin_stats = hist.mean_stdev()
+            bin_band = score_level(
+                raw_g, bin_stats.mean, bin_stats.stdev, **score_args
+            )
+            consistent = (
+                bin_band.kind is AnomalyKind.NONE
+                and abs(raw_g - bin_stats.mean) <= max(
+                    3.0 * bin_stats.stdev, min_delta_g, 0.15 * bin_stats.mean
+                )
+            )
+        else:
+            consistent = abs(raw_g - stats.mean) <= tolerance
+        matches[runout_key] = consistent and band.kind is not AnomalyKind.LOW
+
+    # Score HIGH and LOW on every eligible window, including validation.
+    # Neither history may learn until all relevant references are trusted.
+    trip = book.observe(
+        raw_g, e_speed, edges, short_bead=False,
+        confirm_windows=confirm_windows, recover_windows=recover_windows,
+        trip_high=trip_high, allow_learn=not keys, **score_args,
+    )
+    mismatch_trip = False
+    for key in keys:
+        if matches[key] and trip is None and all(matches.values()):
+            pending[key] = max(0, pending[key]) + 1
+            if pending[key] >= 3:
+                del pending[key]
+        elif not matches[key]:
+            pending[key] = min(0, pending[key]) - 1
+            if pending[key] <= -confirm_windows:
+                mismatch_trip = True
+        else:
+            pending[key] = 0
+    # Unclassifiable but persistent mismatch is a conservative JAM pause,
+    # not permission to relearn. A real LOW takes its normal runout path.
+    if trip is not None:
+        return trip
+    if mismatch_trip:
+        return AnomalyKind.HIGH
+    return None
 
 
 class WindowLevel(NamedTuple):
