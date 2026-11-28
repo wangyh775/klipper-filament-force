@@ -66,11 +66,14 @@ model_profile: default
 model_save_interval: 60.0
 ```
 
-The file is written atomically (temporary file + fsync + replace). Saves are
-periodic, including during long prints, and on Klipper shutdown. Disk writes
-run in a single worker, not the reactor timer. Only healthy
-statistical windows are stored; live force, tare/reference lock, pending trips,
-and anomaly streaks are never restored.
+The file is written atomically (temporary file + fsync + replace). In addition
+to periodic saves, the model is saved when a speed bin or the runout reference
+first learns, when a print ends, and on Klipper shutdown. Disk writes run in a
+single worker. `RESTART` and `FIRMWARE_RESTART` wait for the latest snapshot after
+the reactor stops, before loading the model again. After an abrupt power loss,
+only completed saves can be recovered. Only healthy statistical windows are
+stored; live force, tare/reference lock, pending trips, and anomaly streaks
+are never restored.
 
 After restart, both restored references remain active for detection while
 learning is frozen. Three consecutive eligible matching windows validate a

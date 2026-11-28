@@ -377,6 +377,7 @@ class FilamentForce:
         self.printer.register_event_handler("klippy:ready", self._handle_ready)
         self.printer.register_event_handler("print_stats:reset", self._handle_job_reset)
         self.printer.register_event_handler("klippy:shutdown", self._handle_model_shutdown)
+        self.printer.register_event_handler("klippy:disconnect", self._handle_model_disconnect)
         for event in (
             "print_stats:complete_printing",
             "print_stats:error_printing",
@@ -548,11 +549,11 @@ class FilamentForce:
                 result.state, result.reason,
             )
 
-    def _collect_model_save(self) -> bool:
+    def _collect_model_save(self, *, wait: bool = False) -> bool:
         future = self._model_future
         if future is None:
             return True
-        if not future.done():
+        if not wait and not future.done():
             return False
         self._model_future = None
         try:
@@ -562,10 +563,12 @@ class FilamentForce:
             logging.exception("filament_force model_store save failed")
         return True
 
-    def _save_model_store(self) -> None:
+    def _save_model_store(self, *, checkpoint: bool = False) -> None:
         if not self.model_persistence:
             return
-        if not self._collect_model_save() or not self._model_dirty:
+        if not self._collect_model_save() and not checkpoint:
+            return
+        if not self._model_dirty:
             return
         try:
             # Snapshot on reactor; only the worker owns the detached payload.
@@ -588,14 +591,17 @@ class FilamentForce:
         self._model_dirty = True
 
     def _handle_model_shutdown(self) -> None:
+        self._save_model_store(checkpoint=True)
+
+    def _handle_model_disconnect(self) -> None:
         if not self.model_persistence:
             return
-        try:
-            # Serialize after any in-flight write; do not wait in the reactor.
-            payload = snapshot(self.books, self._model_fingerprint())
-            self._model_writer.submit(self.model_store.save_payload, payload)
-        except Exception:
-            logging.exception("filament_force model_store shutdown save failed")
+        # Klipper sends disconnect after the reactor has stopped and before
+        # the next instance loads its model. Drain the old writer first.
+        self._collect_model_save(wait=True)
+        self._save_model_store()
+        self._model_writer.shutdown(wait=True)
+        self._collect_model_save()
 
     def _persist_reset(self, gcmd: GCodeCommand) -> None:
         if not self.model_persistence:
@@ -619,8 +625,9 @@ class FilamentForce:
             raise gcmd.error(f"filament_force: reset not confirmed on disk: {exc}")
 
     def _handle_job_reset(self, *args: object) -> None:
-        """Undo only offsets owned by this module when a job ends/resets."""
+        """Checkpoint the model and release state owned by the old job."""
         del args
+        self._save_model_store(checkpoint=True)
         self._diag_generation += 1
         if self._diag.active:
             self._diag.abort()
@@ -963,6 +970,8 @@ class FilamentForce:
 
         book = self._book_for(self.active_tool)
         hist = book.bin_hist(bin_i)
+        bin_was_learned = hist.learned
+        runout_was_learned = book.runout.learned
         tool_key = self.active_tool if self.active_tool >= 0 else -1
         validating = (
             (tool_key, bin_i) in self._restored_bins
@@ -1038,6 +1047,11 @@ class FilamentForce:
         )
         trip_kind = TripKind.from_anomaly(trip) if trip is not None else None
         self._model_dirty = True
+        if (
+            (hist.learned and not bin_was_learned)
+            or (book.runout.learned and not runout_was_learned)
+        ):
+            self._save_model_store(checkpoint=True)
         if trip_kind is None:
             return next_time
         # Trips are rare: always write klippy.log, even if debug_log is off.

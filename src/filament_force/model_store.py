@@ -154,12 +154,13 @@ class ModelStore:
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(tempname, self.path)
-            # Persist the directory entry as well as the file contents (Linux).
-            dir_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
+            # Persist the directory entry as well as the file contents on Linux.
+            if os.name != "nt":
+                dir_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
         finally:
             if os.path.exists(tempname):
                 os.unlink(tempname)
