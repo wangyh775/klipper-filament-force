@@ -103,3 +103,24 @@ class Recovery:
             and isfinite(current_z)
             and current_z <= self.before_z * (1.0 - fraction)
         )
+
+
+def shifted_pause_state(state: object, step: float) -> dict[str, object]:
+    """Copy a compatible Kalico PAUSE_STATE with a larger physical Z gap.
+
+    Shifting all three Z entries preserves the saved logical G-code Z
+    while shifting the restore move. Do not mutate the original state.
+    """
+    if not isinstance(state, dict) or not isfinite(step) or not 0 < step <= 0.05:
+        raise ValueError("invalid pause state or Z increment")
+    result: dict[str, object] = dict(state)
+    for key in ("base_position", "homing_position", "last_position"):
+        source = state.get(key)
+        if not isinstance(source, (list, tuple)) or len(source) != 4:
+            raise ValueError("incompatible Kalico pause state")
+        coords = list(source)
+        if not all(type(x) in (float, int) and isfinite(x) for x in coords):
+            raise ValueError("nonfinite pause coordinates")
+        coords[2] += step
+        result[key] = coords
+    return result
