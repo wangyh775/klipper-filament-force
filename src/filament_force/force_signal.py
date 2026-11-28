@@ -703,6 +703,15 @@ class WindowLevel(NamedTuple):
     level: float
     e_speed: float
     t_win: float = 0.0
+    sample_count: int = 0
+    max_sample_gap_s: float = 0.0
+    sample_span_s: float = 0.0
+
+    def qualified(self, *, min_samples: int, max_gap_s: float,
+                  edge_allowance_s: float) -> bool:
+        return (self.sample_count >= min_samples
+                and self.max_sample_gap_s <= max_gap_s
+                and self.sample_span_s + edge_allowance_s >= self.t_win)
 
 
 @dataclass
@@ -731,8 +740,13 @@ class EWindowAccumulator:
     last_e_time: float | None = None
     samples: Deque[Sample] = field(default_factory=deque)
     active: bool = False
+    first_sample_time: float | None = None
+    last_sample_time: float | None = None
+    max_sample_gap_s: float = 0.0
 
     def reset(self) -> None:
+        self.first_sample_time = self.last_sample_time = None
+        self.max_sample_gap_s = 0.0
         self.e_accum = 0.0
         self.level_sum = 0.0
         self.level_n = 0
@@ -781,6 +795,15 @@ class EWindowAccumulator:
     def add_force(self, sample: Sample) -> None:
         if not self.active:
             return
+        if self.first_sample_time is None:
+            self.first_sample_time = sample.timestamp
+        if self.last_sample_time is not None:
+            gap = sample.timestamp - self.last_sample_time
+            if gap <= 0:
+                self.max_sample_gap_s = float("inf")
+            else:
+                self.max_sample_gap_s = max(self.max_sample_gap_s, gap)
+        self.last_sample_time = sample.timestamp
         self.samples.append(sample)
         keep = self.rolling_window_s + 0.5
         cutoff = sample.timestamp - keep
@@ -829,7 +852,11 @@ class EWindowAccumulator:
         raw = self.mean_level
         mean_spd = self.mean_e_speed
         span = self.t_win
+        count, gap = self.level_n, self.max_sample_gap_s
+        first, last = self.first_sample_time, self.last_sample_time
+        sample_span = max(0.0, last - first) if first is not None and last is not None else 0.0
         self.reset()
         return WindowLevel(
-            level=raw, e_speed=mean_spd, t_win=span
+            level=raw, e_speed=mean_spd, t_win=span,
+            sample_count=count, max_sample_gap_s=gap, sample_span_s=sample_span,
         )

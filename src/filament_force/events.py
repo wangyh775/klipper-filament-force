@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections import deque
+from copy import deepcopy
 from math import isfinite
 from typing import Any
 from uuid import uuid4
@@ -58,15 +59,22 @@ class EventJournal:
             "columns": ["t_s", "force_g"],
             "samples": [[round(s.timestamp - t0, 6), round(s.force, 3)]
                         for s in selected] if t0 is not None else [],
-            "windows": list(self.windows),
+            "windows": deepcopy(list(self.windows)),
         }
 
     def emit(self, kind: str, **fields: Any) -> dict[str, Any]:
         self.seq += 1
         event = {"schema": 1, "boot_id": self.boot_id, "seq": self.seq,
                  "event_id": f"{self.boot_id}:{self.seq}", "kind": kind, **fields}
-        self.events.append(event)
-        return event
+        self.events.append(deepcopy(event))
+        return deepcopy(event)
+
+    def incident_window(self, event_id: str | None) -> dict[str, Any] | None:
+        if event_id is not None:
+            for event in reversed(self.events):
+                if event["event_id"] == event_id and isinstance(event.get("window"), dict):
+                    return deepcopy(event["window"])
+        return None
 
     def status(self) -> list[dict[str, Any]]:
-        return list(self.events)
+        return deepcopy(list(self.events))

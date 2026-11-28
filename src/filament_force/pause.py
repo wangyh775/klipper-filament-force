@@ -126,11 +126,7 @@ class MonitorActions:
         suffix = ""
         if velocity is not None:
             suffix = f" VELOCITY={velocity}"
-        client_resume = self.printer.lookup_object("gcode_macro _CLIENT_RESUME", None)
-        if client_resume is not None:
-            self.gcode.run_script_from_command("_CLIENT_RESUME" + suffix)
-        else:
-            self.gcode.run_script_from_command("RESUME_BASE" + suffix)
+        self.gcode.run_script_from_command("RESUME" + suffix)
 
     def set_pending(
         self,
