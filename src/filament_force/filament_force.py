@@ -37,6 +37,7 @@ from .pause import MonitorActions, MonitorTemplate
 from .first_layer import FirstLayerZControl
 from .model_store import ModelStore, snapshot
 from .free_air import Diagnosis, FreeAirDiagnostic
+from .recovery import ForceReference, Recovery, RecoveryState, shifted_pause_state
 
 if TYPE_CHECKING:
     from klippy.configfile import ConfigWrapper
@@ -47,6 +48,7 @@ if TYPE_CHECKING:
 
 
 _JAM_ACTION = "FILAMENT_FORCE_JAM_ACTION"
+_CONFIRMED_JAM_ACTION = "FILAMENT_FORCE_CONFIRMED_JAM_ACTION"
 
 
 def _resolve_load_cell(sensor: object) -> LoadCell:
@@ -254,6 +256,23 @@ class FilamentForce:
             )
             self.first_layer.enabled = False
         self.diagnostic_enabled = config.getboolean("diagnostic_enabled", False)
+        self.diagnostic_auto = config.getboolean("diagnostic_auto", False)
+        self.diagnostic_match_speed = config.getboolean("diagnostic_match_speed", True)
+        self.auto_resume_enabled = config.getboolean("auto_resume_enabled", False)
+        self.auto_resume_max_attempts = config.getint("auto_resume_max_attempts", 2, minval=1, maxval=5)
+        self.auto_resume_verify_windows = config.getint("auto_resume_verify_windows", 3, minval=1)
+        self.recovery_verify_timeout = config.getfloat("recovery_verify_timeout", 60.0, above=0.0)
+        self.first_layer_verify_windows = config.getint("first_layer_verify_windows", 2, minval=1)
+        self.first_layer_min_improvement = config.getfloat("first_layer_min_improvement", 0.15, above=0.0, maxval=1.0)
+        self.first_layer_z_max_total = config.getfloat("first_layer_z_max_total", 0.06, above=0.0, maxval=0.2)
+        self._recovery = Recovery()
+        self._incident_speed = 0.0
+        self._incident_force = 0.0
+        self._incident_layer: int | None = None
+        self._incident_recoverable = False
+        self._live_e_speed = 0.0
+        self._live_e_at: float | None = None
+        self._recovery_z_origin: float | None = None
         self.diagnostic_limit = config.getfloat("diagnostic_force_limit", 0.0, minval=0.0)
         self.diagnostic_low = config.getfloat("diagnostic_force_min", 0.0, minval=0.0)
         self.diagnostic_high = config.getfloat("diagnostic_force_max", 0.0, minval=0.0)
@@ -403,6 +422,10 @@ class FilamentForce:
         )
 
         self._register_jam_action(config)
+        self.gcode.register_command(
+            "FILAMENT_FORCE_DIAG_READY", self.cmd_FILAMENT_FORCE_DIAG_READY,
+            desc="Acknowledge safe floating nozzle after pre-diagnosis strategy",
+        )
         self.gcode.register_command(
             "FILAMENT_FORCE_SET",
             self.cmd_FILAMENT_FORCE_SET,
@@ -706,6 +729,8 @@ class FilamentForce:
         del args
         self._save_model_store(checkpoint=True)
         self._diag_generation += 1
+        self._recovery = Recovery()
+        self._incident_recoverable = False
         for book in self.books.values():
             book.clear_streaks()
         for key in self._restored_bins:
@@ -880,6 +905,8 @@ class FilamentForce:
         self._seen_forward_e = False
         self._idle_confirmed = False
         self._jam_above_since = None
+        self._live_e_speed = 0.0
+        self._live_e_at = None
 
     def _disarm(self) -> None:
         self._armed = False
@@ -975,6 +1002,8 @@ class FilamentForce:
         return float(self._extruder.find_past_position(print_time))
 
     def _note_idle(self, eventtime: float) -> None:
+        self._live_e_speed = 0.0
+        self._live_e_at = None
         self._idle_confirmed = True
         if self._e_idle_since is None:
             self._e_idle_since = eventtime
@@ -1023,6 +1052,8 @@ class FilamentForce:
             return next_time
 
         e_speed = de / dt
+        self._live_e_speed = e_speed
+        self._live_e_at = eventtime
         if e_speed < self.min_e_speed:
             self._note_idle(eventtime)
             return next_time
@@ -1451,7 +1482,7 @@ class FilamentForce:
 
 
     cmd_FILAMENT_FORCE_DIAGNOSE_help = (
-        "Supervised free-air test after a statistical jam pause; "
+        "Free-air test after either jam pause; "
         "FILAMENT_FORCE_DIAGNOSE CLEARANCE=1"
     )
 
@@ -1488,6 +1519,10 @@ class FilamentForce:
         )
 
     def cmd_FILAMENT_FORCE_DIAGNOSE(self, gcmd: GCodeCommand) -> None:
+        expected = gcmd.get_int("GENERATION", self._diag_generation)
+        recover = bool(gcmd.get_int("RECOVER", 0, minval=0, maxval=1))
+        if expected != self._diag_generation:
+            return
         if not self.diagnostic_enabled:
             raise gcmd.error("filament_force: free-air diagnosis disabled")
         if gcmd.get_int("CLEARANCE", 0, minval=0, maxval=1) != 1:
@@ -1496,7 +1531,7 @@ class FilamentForce:
             self._diag.active or self._diag_attempted or self._triggering
             or self._spike.active or self._cal.active or self._load_cell is None
             or self._estimated_print_time is None
-            or self._diag_trip_source != "band"
+            or self._diag_trip_source not in ("band", "hard", "model_validation")
         ):
             raise gcmd.error("filament_force: diagnosis unavailable or already attempted")
         limit = min(self.diagnostic_limit, self.oh_shit_force)
@@ -1510,6 +1545,22 @@ class FilamentForce:
             self._load_cell.add_client(self._force_client)
             self._client_attached = True
         self._diag_attempted = True
+        self._recovery.state = RecoveryState.DIAGNOSING
+        speed = self.diagnostic_speed
+        if self.diagnostic_match_speed and self._incident_speed > 0:
+            speed = min(2.0, max(0.5, self._incident_speed))
+        pulse = max(self.diagnostic_pulse, speed * 0.5)
+        book = self._book_for(self.active_tool)
+        ref = self._force_reference(book, force_signal.speed_bin_index(speed, self.speed_bin_edges))
+        bounds = ref.diagnostic_bounds(limit) if ref is not None else None
+        low, high = (bounds if bounds is not None else
+                     (self.diagnostic_low, self.diagnostic_high))
+        matched = (
+            bounds is not None and self._incident_speed > 0
+            and abs(speed - self._incident_speed) <= 0.2 * self._incident_speed
+            and force_signal.speed_bin_index(speed, self.speed_bin_edges)
+            == force_signal.speed_bin_index(self._incident_speed, self.speed_bin_edges)
+        )
         d = self._diag
         d.begin(limit)
         saved = False
@@ -1531,9 +1582,9 @@ class FilamentForce:
                 start = toolhead.get_last_move_time()
                 d.capture(start)
                 self.gcode.run_script_from_command(
-                    f"G1 E{self.diagnostic_pulse:.3f} F{self.diagnostic_speed * 60:.3f}"
+                    f"G1 E{pulse:.3f} F{speed * 60:.3f}"
                 )
-                d.extruded_mm += self.diagnostic_pulse
+                d.extruded_mm += pulse
                 end = toolhead.get_last_move_time()
                 self.gcode.run_script_from_command("M400")
                 self.reactor.pause(self.reactor.monotonic() + 0.3)
@@ -1543,7 +1594,7 @@ class FilamentForce:
                     break
                 # Last nominal duration lies within the queued move, avoiding
                 # any gap inserted by the toolhead when restarting from idle.
-                start = max(start, end - self.diagnostic_pulse / self.diagnostic_speed)
+                start = max(start, end - pulse / speed)
                 if not d.record_pulse(start, end):
                     break
             if not d.active or not self._diagnostic_ready(generation):
@@ -1551,10 +1602,11 @@ class FilamentForce:
             else:
                 d.finish(
                     expected_pulses=self.diagnostic_count,
-                    low_g=self.diagnostic_low, high_g=self.diagnostic_high,
+                    low_g=low, high_g=high,
                 )
         except Exception:
             d.abort()
+            self._recovery.fail("diagnostic exception")
             logging.exception("filament_force free-air diagnosis failed")
             raise
         finally:
@@ -1573,12 +1625,73 @@ class FilamentForce:
             f"filament_force free-air: {d.result.value}; mean_g={means}; "
             f"peak_g={peaks}; extruded_mm={d.extruded_mm:.2f}; "
             f"first_layer_contact_possible={int(contact_possible)}; "
-            "paused, inspect extrudate and resolve manually"
+            f"speed={speed:.3f}; reference_match={int(matched)}"
         )
         logging.info(msg)
         self.last_msg = msg
         gcmd.respond_info(msg)
+        if generation != self._diag_generation:
+            return
+        if not self._diagnostic_ready(generation):
+            self._recovery.fail("diagnostic context changed")
+            return
+        if d.result in (Diagnosis.RESTRICTION_SUSPECTED, Diagnosis.FORCE_LIMIT):
+            self._recovery.state = RecoveryState.CONFIRMED_JAM
+            mean = max((p.mean_g for p in d.pulses), default=0.0)
+            peak = max((p.peak_g for p in d.pulses), default=0.0)
+            try:
+                self.gcode.run_script_from_command(
+                    f"{_CONFIRMED_JAM_ACTION} TOOL={self.active_tool}"
+                    f" SOURCE={self._diag_trip_source} FORCE_G={self._incident_force:.3f}"
+                    f" DIAG_MEAN_G={mean:.3f} DIAG_PEAK_G={peak:.3f}"
+                    f" E_SPEED={speed:.3f} TARGET={self.actions.pending_target:.2f}"
+                    f" FIRST_LAYER={int(self._diag_first_layer)} RESULT={d.result.value}"
+                )
+            finally:
+                if self.actions.is_printing() and not self._jam_action_paused():
+                    self.gcode.run_script_from_command("PAUSE\nM400")
+        elif d.result is Diagnosis.FLOW_COMPATIBLE:
+            self._recovery.state = RecoveryState.WAITING_RECOVERY
+            if recover and matched:
+                self._resume_after_diagnosis(generation)
+        else:
+            self._recovery.fail(d.result.value)
 
+    def _force_reference(self, book: force_signal.ToolForceBook,
+                         bin_i: int) -> ForceReference | None:
+        hist = book.bin_hist(bin_i)
+        if not hist.learned:
+            return None
+        stats = hist.mean_stdev()
+        ref = ForceReference(stats.mean, stats.stdev, self.high_sigma,
+                             self.min_delta_g, self.drop_ratio, self.runout_max_level_g)
+        return ref if ref.usable() else None
+
+    def cmd_FILAMENT_FORCE_DIAG_READY(self, gcmd: GCodeCommand) -> None:
+        if (self._recovery.state is not RecoveryState.PREPARING
+            or not self._jam_action_paused()
+            or gcmd.get_int("CLEARANCE", 0, minval=0, maxval=1) != 1):
+            raise gcmd.error("Diagnostic clearance only accepted during paused preparation")
+        self._recovery.clearance = True
+
+    def _auto_diagnose(self, generation: int) -> None:
+        deadline = self.reactor.monotonic() + 5.0
+        while generation == self._diag_generation and self._recovery.state is RecoveryState.WAITING_DIAGNOSIS:
+            if self._diagnostic_ready(generation):
+                try:
+                    self.gcode.run_script(
+                        f"FILAMENT_FORCE_DIAGNOSE CLEARANCE=1 GENERATION={generation} RECOVER=1"
+                    )
+                except Exception:
+                    if generation == self._diag_generation:
+                        self._recovery.fail("automatic diagnosis failed")
+                    logging.exception("filament_force auto diagnosis failed")
+                return
+            now = self.reactor.monotonic()
+            if now >= deadline:
+                self._recovery.fail("pause or diagnostic readiness timeout")
+                return
+            self.reactor.pause(min(now + 0.1, deadline))
 
     def _register_jam_action(self, config: ConfigWrapper) -> None:
         self._custom_jam_action = any(
@@ -1587,10 +1700,17 @@ class FilamentForce:
         )
         if not self._custom_jam_action:
             self.gcode.register_command(_JAM_ACTION, self._default_jam_action)
+        if not any(section.get_name().split()[-1].upper() == _CONFIRMED_JAM_ACTION
+                   for section in config.get_prefix_sections("gcode_macro ")):
+            self.gcode.register_command(_CONFIRMED_JAM_ACTION, self._default_confirmed_jam_action)
+
+    def _default_confirmed_jam_action(self, _gcmd: GCodeCommand) -> None:
+        self.gcode.respond_info("filament_force: free-air high resistance; inspect while paused")
 
     def _default_jam_action(self, _gcmd: GCodeCommand) -> None:
         """Pause after a learned-band filament jam."""
-        self.gcode.run_script_from_command("PAUSE\nM400")
+        if not self._jam_action_paused():
+            self.gcode.run_script_from_command("PAUSE\nM400")
 
     def _jam_action_paused(self) -> bool:
         state = self.actions.print_stats_state()
@@ -1605,30 +1725,32 @@ class FilamentForce:
 
     def _run_jam_action(self, tool: int, target: float, force_g: float) -> None:
         self.actions.set_pending(tool=tool, target=target, reason=TripKind.JAM.value)
-        if self._custom_jam_action:
-            msg = f"{self.last_msg}. Running {_JAM_ACTION}."
-        else:
-            msg = f"{self.last_msg}. Pausing - fix filament, then RESUME."
-        self.gcode.respond_info(msg)
+        self._recovery.prepare()
+        generation = self._diag_generation
+        self.gcode.respond_info(f"{self.last_msg}. Preparing diagnosis.")
         try:
+            if not self._jam_action_paused():
+                self.gcode.run_script_from_command("PAUSE\nM400")
             self.gcode.run_script_from_command(
                 f"{_JAM_ACTION} TOOL={tool} FORCE_G={force_g:.3f}"
                 f" TARGET={target:.2f} FIRST_LAYER={int(self._diag_first_layer)}"
+                f" SOURCE={self._diag_trip_source} E_SPEED={self._incident_speed:.3f}"
             )
-        except Exception:
-            if not self._custom_jam_action:
-                raise
-            logging.exception("filament_force: custom jam action failed")
-            if self.actions.is_printing() and not self._jam_action_paused():
-                self.gcode.respond_info("filament_force: custom jam action failed. Pausing.")
-                self.gcode.run_script_from_command("PAUSE\nM400")
-        finally:
+            self.gcode.run_script_from_command("M400")
+            if generation != self._diag_generation:
+                return
             if not self._jam_action_paused():
-                # If the macro continued or ended the job, release the lockout.
-                # Do not mix macro extrusion into the next detection window.
-                self.actions.clear_pending()
-                self._window.reset()
-                self._last_e_pos = self._last_e_time = None
+                self.gcode.run_script_from_command("PAUSE\nM400")
+                self._recovery.fail("preparation did not remain paused")
+                return
+            self._recovery.state = RecoveryState.WAITING_DIAGNOSIS
+            if self.diagnostic_enabled and self.diagnostic_auto and self._recovery.clearance:
+                self.reactor.register_callback(lambda _t: self._auto_diagnose(generation))
+        except Exception:
+            self._recovery.fail("preparation strategy failed")
+            logging.exception("filament_force pre-diagnosis strategy failed")
+            if self.actions.is_printing() and not self._jam_action_paused():
+                self.gcode.run_script_from_command("PAUSE\nM400")
 
     def _trip(
         self, kind: TripKind, detail: str,
@@ -1655,13 +1777,15 @@ class FilamentForce:
         printing = self.actions.is_printing()
         if not printing and not self._test_runout:
             return
-        # Only statistical HIGH may adjust. Hard-force and runout always pause.
-        if kind is TripKind.JAM:
-            try:
-                if self._maybe_first_layer_adjust(source, force_g):
-                    return
-            except Exception:
-                logging.exception("filament_force first-layer gate failed")
+        was_verifying = self._recovery.state is RecoveryState.VERIFYING
+        self._diag_generation += 1
+        self._incident_force = force_g
+        self._incident_speed = self._last_e_speed if source != "hard" else (
+            self._live_e_speed if self._live_e_at is not None
+            and self.reactor.monotonic() - self._live_e_at <= 2 * self.poll_interval else 0.0
+        )
+        self._incident_layer = None
+        self._incident_recoverable = source in ("band", "hard") and not (was_verifying and source == "hard")
         self._spike.abort()
         tool = self.active_tool
         target = self.actions.extruder_target()
@@ -1670,11 +1794,12 @@ class FilamentForce:
         self._diag = FreeAirDiagnostic()
         self._diag_trip_source = source
         self._diag_first_layer = False
-        if kind is TripKind.JAM and source == "band":
+        if kind is TripKind.JAM:
             try:
                 stats_obj = self.printer.lookup_object("print_stats", None)
                 if stats_obj is not None:
                     layer = (stats_obj.get_status(self.reactor.monotonic()).get("info") or {}).get("current_layer")
+                    self._incident_layer = layer if type(layer) is int and layer > 0 else None
                     z, homed = self._first_layer_z_position()
                     self._diag_first_layer = (
                         type(layer) is int and layer == 1 and homed
@@ -1704,7 +1829,7 @@ class FilamentForce:
         if not printing:
             self._log_info(f"{self.last_msg}. Idle test - no pause.")
         elif self.actions.in_print_job():
-            if kind is TripKind.JAM and source == "band" and not self._jam_action_paused():
+            if kind is TripKind.JAM:
                 self._run_jam_action(tool, target, force_g)
             else:
                 self.actions.soft_pause(
