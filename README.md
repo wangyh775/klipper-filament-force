@@ -168,11 +168,10 @@ required for automatic recovery. By default the configured E-axis speed is
 `diagnostic_match_speed: True` matches the incident speed up to that configured
 ceiling. The minimum pulse length is configurable; actual pulse length is
 max(configured length, speed × 0.5 s), at most 3 mm; 2–3 pulses.
-At 3 mm/s the default pulse is 1.5 mm (4.5 mm over three pulses). A speed mismatch greater than 20%
-or a different bin still forbids auto-resume; fixed 3 mm/s may therefore
-require manual recovery for slow first-layer trips. Enable optional matching
-when this is needed, or validate a suitable configured speed. High resistance
-may still be reported at a lower test speed. A force cap stops further pulses, not an
+At 3 mm/s the default pulse is 1.5 mm (4.5 mm over three pulses). A diagnostic at or above the incident speed may authorize recovery across
+speed bins, provided both learned references are usable and validated.
+A slower diagnostic is accepted only within the same bin and within 20%
+of the incident speed. Qualify this assumption on hardware. A force cap stops further pulses, not an
 already queued move. Low, mixed, missing data or force-cap results stay
 paused. Healthy force is not proof of actual extrusion.
 
@@ -335,3 +334,14 @@ uv sync
 uv run pytest
 uv run ty check src tests
 ```
+
+## Native events and remote monitoring
+
+See [event protocol](docs/events.md). Native `filament_force:<kind>` events
+and a bounded `filament_force.events` status journal carry a unique ID,
+incident linkage and pre-trip force trace. The trace preserves extrema,
+not all raw ADC readings. The latest 16 events survive WebSocket reconnects
+while Klippy remains running. The optional Hermes Monitor bridge stores
+received events in SQLite and forwards their JSON payload. No network calls
+or disk writes in the force sampling callback. Recovery attempt budget resets
+after 60 s of healthy observed printing by default; total attempts are separate.
