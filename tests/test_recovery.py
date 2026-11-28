@@ -78,3 +78,18 @@ def test_verification_expires_both_streaks() -> None:
     assert not r.observe(ref.score(500), 2, eventtime=32, max_gap_s=30)
     assert r.healthy == 1
     assert r.observe(ref.score(500), 2, eventtime=33, max_gap_s=30)
+
+
+def test_recovery_budgets_are_independent() -> None:
+    r = Recovery()
+    r.begin_incident()
+    r.record_auto_attempt(first=True)
+    r.record_auto_attempt(first=False)
+    assert (r.attempts, r.ordinary_attempts, r.incident_attempts) == (2, 1, 2)
+    r.manual_attempts += 1
+    r.prepare()
+    assert (r.attempts, r.ordinary_attempts, r.incident_attempts) == (2, 1, 2)
+    r.reset_consecutive_attempts()
+    assert (r.attempts, r.ordinary_attempts, r.incident_attempts) == (0, 0, 2)
+    r.begin_incident()
+    assert r.incident_attempts == 0 and r.manual_attempts == 1

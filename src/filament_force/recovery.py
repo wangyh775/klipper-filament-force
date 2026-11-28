@@ -59,7 +59,10 @@ class ForceReference:
 @dataclass
 class Recovery:
     state: RecoveryState = RecoveryState.MONITORING
-    attempts: int = 0
+    attempts: int = 0  # consecutive automatic attempts (legacy status)
+    ordinary_attempts: int = 0
+    incident_attempts: int = 0
+    manual_attempts: int = 0  # per-job, never consumes automatic budget
     healthy: int = 0
     bad: int = 0
     deadline: float = 0.0
@@ -68,6 +71,18 @@ class Recovery:
     clearance: bool = False
     failure: str = ""
     last_window_time: float | None = None
+
+    def begin_incident(self) -> None:
+        self.incident_attempts = 0
+
+    def record_auto_attempt(self, *, first: bool) -> None:
+        self.attempts += 1
+        self.incident_attempts += 1
+        if not first:
+            self.ordinary_attempts += 1
+
+    def reset_consecutive_attempts(self) -> None:
+        self.attempts = self.ordinary_attempts = 0
 
     def prepare(self) -> None:
         self.state = RecoveryState.PREPARING
