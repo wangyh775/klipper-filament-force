@@ -6,9 +6,9 @@ A failed PAUSE acknowledgement on an active job now escalates to Klippy shutdown
 
 ## Independent watchdog / 独立看门狗
 
-While a print is active and monitoring is enabled, a 250 ms timer checks advancing finite sensor timestamps and an absent force baseline after eligible E motion. The timer is excluded during explicit suppression, calibration, spike test, diagnosis and preparation/resuming. Sensor timeout 2 s, baseline timeout 3 s, normal baseline max span 100 gf and at least five samples, max gap 0.1 s. These defaults require hardware qualification. On fault, pause with pending reason protection; do not authorize automatic recovery. Manual recovery requires fresh samples. A baseline timeout limits rather than removes the initial blind interval. Status includes protection_fault and sensor_last_sample_age_s; recovery_failed carries the reason. Dedicated sensor events and pre-resume baseline qualification remain future work.
+While a print is active and monitoring is enabled, a 250 ms timer checks advancing finite sensor timestamps and an absent force baseline after eligible E motion. The timer is excluded during explicit suppression, calibration, spike test, diagnosis and preparation/resuming. Sensor timeout 2 s, baseline timeout 3 s, normal baseline max span 100 gf and at least five samples, max gap 0.1 s. These defaults require hardware qualification. On fault, pause with pending reason protection; do not authorize automatic recovery. Manual recovery requires fresh samples. A baseline timeout limits rather than removes the initial blind interval. Status includes protection_fault and sensor_last_sample_age_s; recovery_failed carries the reason. See the subsequent pre-resume reference and event protocol documentation for the implemented extensions.
 
-监控已启用且打印时，独立 250 ms 定时器检查有效递增采样及有效 E 运动后缺少基准。显式抑制、标定、探测、诊断、准备及恢复动作期间除外。断流默认 2 s、基准超时 3 s、正常基准跨度 100 gf、最少 5 点且最大间隔 0.1 s；须实机验证。故障暂停并锁存 protection 原因，不授权自动恢复；人工恢复须有新鲜样本。超时仅限制盲区，不消除盲区。状态含 protection_fault 和 sensor_last_sample_age_s，复用 recovery_failed 携带原因。独立传感器事件和恢复前基准验证仍待实现。
+监控已启用且打印时，独立 250 ms 定时器检查有效递增采样及有效 E 运动后缺少基准。显式抑制、标定、探测、诊断、准备及恢复动作期间除外。断流默认 2 s、基准超时 3 s、正常基准跨度 100 gf、最少 5 点且最大间隔 0.1 s；须实机验证。故障暂停并锁存 protection 原因，不授权自动恢复；人工恢复须有新鲜样本。超时仅限制盲区，不消除盲区。状态含 protection_fault 和 sensor_last_sample_age_s，复用 recovery_failed 携带原因。后续实现见恢复前基准及事件协议文档。
 
 ## Pre-resume reference / 恢复前基准
 

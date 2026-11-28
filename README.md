@@ -341,7 +341,8 @@ See [event protocol](docs/events.md). Native `filament_force:<kind>` events
 and a bounded `filament_force.events` status journal carry a unique ID,
 incident linkage and pre-trip force trace. The trace preserves extrema,
 not all raw ADC readings. The latest 16 events survive WebSocket reconnects
-while Klippy remains running. The optional Hermes Monitor bridge stores
-received events in SQLite and forwards their JSON payload. No network calls
+while Klippy remains running. The optional Moonraker component broadcasts named JSON-RPC notifications
+(`notify_filament_force_*`) with the entire event payload. It is independent
+of every consumer. See [installation and protocol](docs/events.md). No network calls
 or disk writes in the force sampling callback. Recovery attempt budget resets
 after 60 s of healthy observed printing by default; total attempts are separate.

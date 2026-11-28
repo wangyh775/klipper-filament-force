@@ -142,4 +142,4 @@ uv run ty check src tests
 
 ## 原生事件与远程监控
 
-参见 [事件协议（中英文）](docs/events.md)。原生 Klippy 事件 filament_force:<kind> 与状态对象 filament_force.events 同时提供，堵头事件包含故障前受力轨迹、窗口统计与唯一 ID。默认保留 30 秒轨迹、最多 512 个保峰降采样点及最近 16 个事件；非完整原始 ADC 数据。Monitor 可经 Moonraker 订阅并将事件及 JSON 数据写入 SQLite、转发 Hermes。连续健康打印默认 60 秒后重置连续恢复次数，单任务累计次数独立记录。
+参见 [事件协议（中英文）](docs/events.md)。原生 Klippy 事件 filament_force:<kind> 与状态对象 filament_force.events 同时提供，堵头事件包含故障前受力轨迹、窗口统计与唯一 ID。默认保留 30 秒轨迹、最多 512 个保峰降采样点及最近 16 个事件；非完整原始 ADC 数据。可选 Moonraker 组件注册并广播独立的 `notify_filament_force_*` JSON-RPC 通知，携带完整事件负载，且不依赖任何消费端。安装及协议见 [事件接口](docs/events.zh-CN.md)。连续健康打印默认 60 秒后重置连续恢复次数，单任务累计次数独立记录。
