@@ -4,6 +4,8 @@
 
 # filament_force
 
+[简体中文](README.zh-CN.md) | English
+
 Pauses the print on filament runout or a jam, using the toolhead load cell.
 
 Needs `[load_cell_probe]` or `[load_cell]` (Kalico or Klipper).
@@ -12,19 +14,25 @@ Needs `[load_cell_probe]` or `[load_cell]` (Kalico or Klipper).
 
 ```sh
 cd ~
-git clone https://github.com/charliemayall/klipper-filament-force.git
+git clone https://github.com/wangyh775/klipper-filament-force.git
 cd klipper-filament-force
 ./install.sh [~/klipper]
 ```
 
-Pass a Kalico tree if that is not `~/klipper`. The script can copy
+This is a native host-side Klipper/Kalico extras package, not a separate service.
+The installer symlinks `src/filament_force/` into `klippy/extras/filament_force/`;
+no MCU firmware rebuild or pip install is required. Pass a Kalico tree if that
+is not `~/klipper` (e.g. `./install.sh ~/kalico`). The script can copy
 `filament_force.cfg` into `printer_data/config`. Then add:
 
 ```ini
 [include filament_force.cfg]
 ```
 
-Restart Klipper.
+Restart Klipper when no print is running. The installer preserves an existing CFG;
+merge new options manually. To update, run `git pull --ff-only` in the plugin
+repository, rerun `./install.sh` with the same firmware path, then restart.
+The experimental recovery branch is not the stable main branch.
 
 Moonraker update manager:
 
@@ -32,7 +40,7 @@ Moonraker update manager:
 [update_manager filament_force]
 type: git_repo
 path: ~/klipper-filament-force
-origin: https://github.com/charliemayall/klipper-filament-force.git
+origin: https://github.com/wangyh775/klipper-filament-force.git
 primary_branch: main
 managed_services: klipper
 is_system_service: False
@@ -155,11 +163,16 @@ acknowledgment. The default macro deliberately cannot authorize motion.
 
 Diagnosis reuses the learned printing speed bin's band, or manually
 configured min/max if no usable band exists. The normal-model path is
-required for automatic recovery. By default speed tracks the triggering
-E speed within 0.5–2 mm/s. Pulse length is at least 0.5 seconds of motion
-and no more than 1 mm; 2–3 pulses. A speed mismatch greater than 20%
-or a different bin forbids auto-resume; high resistance may still be
-reported at a lower test speed. A force cap stops further pulses, not an
+required for automatic recovery. By default the configured E-axis speed is
+3 mm/s (`diagnostic_speed`, range 0.5–6 mm/s). Optional
+`diagnostic_match_speed: True` matches the incident speed up to that configured
+ceiling. The minimum pulse length is configurable; actual pulse length is
+max(configured length, speed × 0.5 s), at most 3 mm; 2–3 pulses.
+At 3 mm/s the default pulse is 1.5 mm (4.5 mm over three pulses). A speed mismatch greater than 20%
+or a different bin still forbids auto-resume; fixed 3 mm/s may therefore
+require manual recovery for slow first-layer trips. Enable optional matching
+when this is needed, or validate a suitable configured speed. High resistance
+may still be reported at a lower test speed. A force cap stops further pulses, not an
 already queued move. Low, mixed, missing data or force-cap results stay
 paused. Healthy force is not proof of actual extrusion.
 
@@ -305,6 +318,8 @@ Skipped with `probe_busy` if a probe, trip, or cal is already running.
 - `FILAMENT_FORCE_CAL_OH_SHIT` - set the jam stop from a cold extrude; `SAVE_CONFIG` to keep it
 - `FILAMENT_FORCE_TEST_RUNOUT RETRACT=<mm> TEMP=<c>` - should report a runout
 - `FILAMENT_FORCE_CHECK_SPIKE` - one-shot presence check
+- `FILAMENT_FORCE_DIAGNOSE CLEARANCE=1 [RECOVER=1]` - supervised free-air diagnosis
+- `FILAMENT_FORCE_DIAG_READY CLEARANCE=1` - preparation macro acknowledgment
 - `FILAMENT_FORCE_QUERY` - current state
 - `FILAMENT_FORCE_SET_TOOL TOOL=n`
 - `FILAMENT_FORCE_RESET [TOOL=n]` - clear history after a false trip
