@@ -39,6 +39,7 @@ from .model_store import ModelStore, snapshot
 from .free_air import Diagnosis, FreeAirDiagnostic
 from .recovery import ForceReference, Recovery, RecoveryState, shifted_pause_state
 from .z_ownership import ZOwnership
+from .pause_context import PauseContext
 from .events import EventJournal
 from .protection import SampleHealth, StableBaseline
 
@@ -52,6 +53,8 @@ if TYPE_CHECKING:
 
 _JAM_ACTION = "FILAMENT_FORCE_JAM_ACTION"
 _CONFIRMED_JAM_ACTION = "FILAMENT_FORCE_CONFIRMED_JAM_ACTION"
+_PAUSE_ACTION = "FILAMENT_FORCE_PAUSE_ACTION"
+_RESUME_ACTION = "FILAMENT_FORCE_RESUME_ACTION"
 
 
 def _resolve_load_cell(sensor: object) -> LoadCell:
@@ -243,6 +246,8 @@ class FilamentForce:
                 MonitorTemplate.RESUME: "resume_gcode",
             },
         )
+
+        self._pause_context = PauseContext()
 
         # Optional and bounded: statistical HIGH does not prove nozzle too close.
         self.first_layer = FirstLayerZControl(
@@ -483,6 +488,10 @@ class FilamentForce:
             "FILAMENT_FORCE_RESET",
             self.cmd_FILAMENT_FORCE_RESET,
             desc=self.cmd_FILAMENT_FORCE_RESET_help,
+        )
+        self.gcode.register_command(
+            "FILAMENT_FORCE_PAUSE", self.cmd_FILAMENT_FORCE_PAUSE,
+            desc="Request a separate filament_force fault pause",
         )
         self.gcode.register_command(
             "FILAMENT_FORCE_RESUME",
@@ -776,6 +785,7 @@ class FilamentForce:
         self._recovery = Recovery()
         self._incident_id = None
         self._incident_filename = ""
+        self._pause_context = PauseContext()
         self._recovery_total = 0
         self._reset_stability()
         if hasattr(self, "_event_journal"):
@@ -1969,7 +1979,9 @@ class FilamentForce:
             not self.auto_resume_enabled or not self._incident_recoverable
             or self._incident_layer is None or not self.enabled or self.suppress
             or not self._diagnostic_ready(generation)
-            or not self.actions.has_template.get(MonitorTemplate.RESUME)
+            or not (self.actions.has_template.get(MonitorTemplate.RESUME)
+                    or self._custom_resume_action)
+            or not self._pause_context.owned
             or self._z_ownership.cleanup_pending
         ):
             self.gcode.respond_info("filament_force: auto resume unavailable; remains paused")
@@ -2064,11 +2076,12 @@ class FilamentForce:
             self._arm()
             self._seen_forward_e = True
             self.actions.clear_pending()
-            self.actions.do_resume(None)
+            self._execute_fault_resume(None, "automatic")
             if generation != self._diag_generation:
                 return
-            if self._jam_action_paused():
-                raise RuntimeError("resume did not clear pause")
+            if self._jam_action_paused() or not self.actions.is_printing():
+                raise RuntimeError("resume not acknowledged")
+            self._acknowledge_fault_resume("automatic")
             if expected_origin is not None:
                 actual = self._current_z_origin()
                 self._z_ownership.commit(actual)
@@ -2241,9 +2254,32 @@ class FilamentForce:
         )
         if not self._custom_jam_action:
             self.gcode.register_command(_JAM_ACTION, self._default_jam_action)
-        if not any(section.get_name().split()[-1].upper() == _CONFIRMED_JAM_ACTION
-                   for section in config.get_prefix_sections("gcode_macro ")):
+        configured = {section.get_name().split()[-1].upper()
+                      for section in config.get_prefix_sections("gcode_macro ")}
+        if _CONFIRMED_JAM_ACTION not in configured:
             self.gcode.register_command(_CONFIRMED_JAM_ACTION, self._default_confirmed_jam_action)
+        if _PAUSE_ACTION not in configured:
+            self.gcode.register_command(_PAUSE_ACTION, self._default_fault_pause_action)
+        self._custom_resume_action = _RESUME_ACTION in configured
+        if not self._custom_resume_action:
+            self.gcode.register_command(_RESUME_ACTION, self._default_fault_resume_action)
+
+    def _default_fault_pause_action(self, _gcmd: GCodeCommand) -> None:
+        self.gcode.run_script_from_command("PAUSE")
+
+    def _default_fault_resume_action(self, gcmd: GCodeCommand) -> None:
+        self.actions.do_resume(gcmd.get("VELOCITY", None))
+
+    def _execute_fault_resume(self, velocity: str | None, mode: str) -> None:
+        if not self._pause_context.owned:
+            raise RuntimeError("fault pause ownership not acknowledged")
+        suffix = "" if velocity is None else f" VELOCITY={velocity}"
+        self.gcode.run_script_from_command(
+            f"{_RESUME_ACTION} MODE={mode} REASON={self._pause_context.reason}" + suffix)
+
+    def _acknowledge_fault_resume(self, mode: str) -> None:
+        self._pause_context.resume(mode)
+        self._publish_event("resume", **self._pause_context.status())
 
     def _default_confirmed_jam_action(self, _gcmd: GCodeCommand) -> None:
         self.gcode.respond_info("filament_force: free-air high resistance; inspect while paused")
@@ -2260,11 +2296,20 @@ class FilamentForce:
         return self.actions.print_stats_state() == "paused"
 
     def _ensure_fault_pause(self, reason: str) -> bool:
-        """Fail closed when the configured PAUSE fails on an active job."""
+        """Run the weak fault action, then acknowledge actual pause separately."""
         try:
-            if not self._jam_action_paused():
-                self.gcode.run_script_from_command("PAUSE\nM400")
             if self._jam_action_paused():
+                # Do not claim an already-paused job that we did not pause.
+                return True
+            if not self.actions.is_printing():
+                return False
+            category = self.actions.pending_reason or "protection"
+            self._pause_context.request(category, getattr(self, "_incident_id", None))
+            self.gcode.run_script_from_command(
+                f"{_PAUSE_ACTION} REASON={category}\nM400")
+            if self._jam_action_paused():
+                self._pause_context.acknowledge()
+                self._publish_event("pause", **self._pause_context.status())
                 return True
         except Exception:
             logging.exception("filament_force fault pause failed")
@@ -2272,6 +2317,23 @@ class FilamentForce:
             cast(Any, self.printer).invoke_shutdown(
                 "filament_force: fault pause not acknowledged: " + reason)
         return False
+
+    def cmd_FILAMENT_FORCE_PAUSE(self, gcmd: GCodeCommand) -> None:
+        """Explicit module-owned pause; never fabricates a detected jam."""
+        if not self.actions.is_printing() or self._jam_action_paused():
+            raise gcmd.error("filament_force: fault pause requires active unpaused print")
+        if self.actions.pending_recheck or self._recovery.state is not RecoveryState.MONITORING:
+            raise gcmd.error("filament_force: fault/recovery already pending")
+        self._diag_generation += 1
+        self._incident_id = None
+        stats = self.printer.lookup_object("print_stats", None)
+        self._incident_filename = str(stats.get_status(self.reactor.monotonic()).get("filename") or "") if stats is not None else ""
+        self._incident_recoverable = False
+        self.actions.set_pending(tool=self.active_tool, target=self.actions.extruder_target(),
+                                 reason="manual")
+        self._fail_recovery("explicit fault pause")
+        if not self._ensure_fault_pause("explicit fault pause"):
+            raise gcmd.error("filament_force: fault pause not acknowledged")
 
     def _run_jam_action(self, tool: int, target: float, force_g: float) -> None:
         self.actions.set_pending(tool=tool, target=target, reason=TripKind.JAM.value)
@@ -2552,6 +2614,7 @@ class FilamentForce:
             "sigma_jam": 1 if self.sigma_jam else 0,
             "oh_shit_force": self.oh_shit_force,
             "last_oh_shit_cal_peak_g": self._cal.last_peak_g,
+            "pause_context": self._pause_context.status(),
             "pending_recheck": self.actions.pending_recheck,
             "pending_tool": self.actions.pending_tool,
             "last_trip": self.last_trip.value if self.last_trip is not None else "",
@@ -2827,6 +2890,8 @@ class FilamentForce:
     )
 
     def cmd_FILAMENT_FORCE_RESET(self, gcmd: GCodeCommand) -> None:
+        if self.actions.pending_recheck or self._pause_context.owned:
+            raise gcmd.error("filament_force: resolve or cancel the fault pause before resetting model")
         if self._recovery.state in (RecoveryState.PREPARING, RecoveryState.RESUMING, RecoveryState.VERIFYING):
             raise gcmd.error("filament_force: cannot reset model during recovery")
         if self._diag.active:
@@ -2874,10 +2939,7 @@ class FilamentForce:
         if self._z_ownership.cleanup_pending:
             raise gcmd.error("filament_force: unresolved Z compensation; cancel and reconcile at idle")
         if not self.actions.pending_recheck:
-            if self.actions.in_print_job():
-                self.actions.do_resume(velocity)
-            else:
-                gcmd.respond_info("filament_force: nothing pending")
+            gcmd.respond_info("filament_force: no owned fault pause; use ordinary RESUME")
             return
         if self.actions.pending_reason == "protection":
             age = self._sample_health.age(self.reactor.monotonic())
@@ -2891,8 +2953,8 @@ class FilamentForce:
             self._recovery.state = RecoveryState.MONITORING
             gcmd.respond_info("filament_force: cleared pending lockout (no active job)")
             return
-        if not self._jam_action_paused():
-            raise gcmd.error("filament_force: manual recovery requires acknowledged pause")
+        if not self._jam_action_paused() or not self._pause_context.owned:
+            raise gcmd.error("filament_force: manual recovery requires an owned acknowledged fault pause")
         self._diag_generation += 1
         generation = self._diag_generation
         self._recovery.state = RecoveryState.RESUMING
@@ -2919,11 +2981,12 @@ class FilamentForce:
             self._unlock_baseline()
             self._spike.abort()
             self.actions.clear_pending()
-            self.actions.do_resume(velocity)
+            self._execute_fault_resume(velocity, "manual")
             if generation != self._diag_generation:
                 return
-            if self._jam_action_paused():
-                raise RuntimeError("manual resume did not clear pause")
+            if self._jam_action_paused() or not self.actions.is_printing():
+                raise RuntimeError("manual resume not acknowledged")
+            self._acknowledge_fault_resume("manual")
             self._recovery.state = RecoveryState.MONITORING
             self._recovery.clear_evidence()
             self._recovery.failure = ""

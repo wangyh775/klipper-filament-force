@@ -10,7 +10,7 @@ from typing import Any
 KINDS = (
     "jam_detected", "runout_detected", "diagnosis_result", "jam_confirmed",
     "z_adjusted", "recovery_started", "recovery_verified", "recovery_failed",
-    "sensor_fault",
+    "sensor_fault", "pause", "resume",
 )
 OBJECT = "filament_force"
 SECTION = "filament_force_events"

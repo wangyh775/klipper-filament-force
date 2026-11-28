@@ -11,6 +11,7 @@ from filament_force.first_layer import FirstLayerZControl
 from filament_force.free_air import FreeAirDiagnostic
 from filament_force.force_signal import EWindowAccumulator, TripKind
 from filament_force.pause import MonitorActions, MonitorTemplate
+from filament_force.pause_context import PauseContext
 from filament_force.recovery import Recovery, RecoveryState
 from filament_force.protection import SampleHealth
 from filament_force.z_ownership import ZOwnership
@@ -69,6 +70,7 @@ def monitor(
     result._diagnostic_stop_queued = False
     result.diagnostic_shutdown_on_limit = True
     result._recovery = Recovery()
+    result._pause_context = PauseContext()
     result._z_ownership = ZOwnership()
     result._last_e_speed = 1.5
     result._live_e_speed = 0.0
@@ -95,6 +97,8 @@ def test_both_weak_actions_are_registered(
     assert gcode.register_command.call_args_list == [
         call("FILAMENT_FORCE_JAM_ACTION", monitor._default_jam_action),
         call("FILAMENT_FORCE_CONFIRMED_JAM_ACTION", monitor._default_confirmed_jam_action),
+        call("FILAMENT_FORCE_PAUSE_ACTION", monitor._default_fault_pause_action),
+        call("FILAMENT_FORCE_RESUME_ACTION", monitor._default_fault_resume_action),
     ]
     monitor._default_jam_action(Mock())
     gcode.run_script_from_command.assert_called_once_with("PAUSE\nM400")
@@ -104,14 +108,16 @@ def test_custom_action_overrides_only_its_own_hook(
     monitor: FilamentForce, gcode: Mock
 ) -> None:
     configure_action(monitor, "gcode_macro filament_force_jam_action")
-    gcode.register_command.assert_called_once_with(
+    gcode.register_command.assert_any_call(
         "FILAMENT_FORCE_CONFIRMED_JAM_ACTION", monitor._default_confirmed_jam_action
     )
+    assert gcode.register_command.call_count == 3
     gcode.reset_mock()
     configure_action(monitor, "gcode_macro filament_force_confirmed_jam_action")
-    gcode.register_command.assert_called_once_with(
+    gcode.register_command.assert_any_call(
         "FILAMENT_FORCE_JAM_ACTION", monitor._default_jam_action
     )
+    assert gcode.register_command.call_count == 3
 
 
 @pytest.mark.parametrize("source", ["band", "hard", "model_validation"])
@@ -122,7 +128,7 @@ def test_both_detectors_pause_then_invoke_preparation(
     configure_action(monitor, "gcode_macro FILAMENT_FORCE_JAM_ACTION")
 
     def run(script: str) -> None:
-        if script == "PAUSE\nM400":
+        if script == "FILAMENT_FORCE_PAUSE_ACTION REASON=jam\nM400":
             stats.get_status.return_value = {"state": "paused"}
 
     gcode.run_script_from_command.side_effect = run
@@ -133,7 +139,7 @@ def test_both_detectors_pause_then_invoke_preparation(
     assert monitor.actions.pending_reason == "jam"
     assert monitor._recovery.state is RecoveryState.WAITING_DIAGNOSIS
     assert gcode.run_script_from_command.call_args_list == [
-        call("PAUSE\nM400"),
+        call("FILAMENT_FORCE_PAUSE_ACTION REASON=jam\nM400"),
         call("FILAMENT_FORCE_JAM_ACTION TOOL=0 FORCE_G=700.000 TARGET=400.00 FIRST_LAYER=1"
              f" SOURCE={source} E_SPEED={0.0 if source == 'hard' else 1.5:.3f}"),
         call("M400"),
@@ -166,7 +172,7 @@ def test_runout_retains_independent_pause(
     configure_action(monitor, "gcode_macro FILAMENT_FORCE_JAM_ACTION")
     monitor._trip(TripKind.RUNOUT, "fault", source="band")
     assert gcode.run_script_from_command.call_args_list == [
-        call("PAUSE\nM400"),
+        call("FILAMENT_FORCE_PAUSE_ACTION REASON=runout\nM400"),
     ]
     assert monitor.actions.pending_recheck
 
@@ -177,7 +183,7 @@ def test_no_pause_ack_blocks_preparation(
     configure_action(monitor)
     monitor._trip(TripKind.JAM, "fault", source="band")
     assert monitor._recovery.state is RecoveryState.FAILED
-    assert gcode.run_script_from_command.call_args_list == [call("PAUSE\nM400")]
+    assert gcode.run_script_from_command.call_args_list == [call("FILAMENT_FORCE_PAUSE_ACTION REASON=jam\nM400")]
     cast(Mock, monitor.printer).invoke_shutdown.assert_called_once()
 
 
@@ -277,6 +283,8 @@ def test_manual_recovery_preparation_failure_keeps_pending_reason(
     stats.get_status.return_value = {"state": "paused"}
     monitor._diag = FreeAirDiagnostic()
     monitor.actions.set_pending(tool=0, target=400, reason="jam")
+    monitor._pause_context.request("jam", None)
+    monitor._pause_context.acknowledge()
     monitor._recovery.fail("jam")
     monitor._recovery.record_auto_attempt(first=False)
     legacy_hook.side_effect = RuntimeError("recover macro failed")
@@ -323,7 +331,7 @@ def test_watchdog_sensor_event_links_failure(monitor: FilamentForce, gcode: Mock
     )
     monitor._stop_unprotected(monitor._diag_generation, "load cell stream stale")
     events = monitor._event_journal.status()
-    assert [e["kind"] for e in events] == ["sensor_fault", "recovery_failed"]
+    assert [e["kind"] for e in events] == ["sensor_fault", "recovery_failed", "pause"]
     assert events[0]["window"]["samples"] == []
     assert events[1]["incident_id"] == events[0]["event_id"]
     assert monitor.actions.pending_reason == "protection"
@@ -425,3 +433,68 @@ def test_diagnostic_shutdown_is_latched_and_mutex_free(monitor: FilamentForce) -
     reactor.register_callback.assert_called_once()
     reactor.register_callback.call_args.args[0](1.0)
     cast(Mock, monitor.printer).invoke_shutdown.assert_called_once()
+
+
+def test_custom_fault_macros_registered_independently(monitor: FilamentForce, gcode: Mock) -> None:
+    configure_action(monitor, "gcode_macro FILAMENT_FORCE_PAUSE_ACTION")
+    commands = [c.args[0] for c in gcode.register_command.call_args_list]
+    assert "FILAMENT_FORCE_PAUSE_ACTION" not in commands
+    assert "FILAMENT_FORCE_RESUME_ACTION" in commands
+    gcode.reset_mock()
+    configure_action(monitor, "gcode_macro FILAMENT_FORCE_RESUME_ACTION")
+    commands = [c.args[0] for c in gcode.register_command.call_args_list]
+    assert "FILAMENT_FORCE_RESUME_ACTION" not in commands
+    assert "FILAMENT_FORCE_PAUSE_ACTION" in commands
+    assert monitor._custom_resume_action
+
+
+def test_ordinary_pause_not_claimed(monitor: FilamentForce, gcode: Mock, stats: Mock) -> None:
+    stats.get_status.return_value = {"state": "paused"}
+    assert monitor._ensure_fault_pause("jam")
+    assert not monitor._pause_context.owned
+    gcode.run_script_from_command.assert_not_called()
+
+
+def test_owned_pause_resume_share_identifier(monitor: FilamentForce, gcode: Mock,
+                                             stats: Mock, monkeypatch: pytest.MonkeyPatch) -> None:
+    publish = Mock()
+    monkeypatch.setattr(monitor, "_publish_event", publish)
+    monitor.actions.set_pending(reason="jam")
+    monitor._incident_id = "incident"
+    gcode.run_script_from_command.side_effect = lambda _s: stats.get_status.configure_mock(
+        return_value={"state": "paused"})
+    assert monitor._ensure_fault_pause("jam")
+    assert monitor._ensure_fault_pause("jam")
+    assert publish.call_count == 1
+    pause_id = monitor._pause_context.pause_id
+    gcode.run_script_from_command.side_effect = lambda _s: stats.get_status.configure_mock(
+        return_value={"state": "printing"})
+    monitor._execute_fault_resume("30", "manual")
+    monitor._acknowledge_fault_resume("manual")
+    assert publish.call_args.args == ("resume",)
+    assert publish.call_args.kwargs["pause_id"] == pause_id
+    assert publish.call_args.kwargs["pause_incident_id"] == "incident"
+    assert publish.call_args.kwargs["resume_mode"] == "manual"
+    assert not monitor._pause_context.owned
+    gcode.run_script_from_command.assert_called_with(
+        "FILAMENT_FORCE_RESUME_ACTION MODE=manual REASON=jam VELOCITY=30")
+
+
+def test_fault_resume_without_pending_does_not_resume_normal_pause(
+    monitor: FilamentForce, gcode: Mock, stats: Mock,
+) -> None:
+    stats.get_status.return_value = {"state": "paused"}
+    monitor._diag = FreeAirDiagnostic()
+    command = Mock()
+    command.get.return_value = None
+    monitor.cmd_FILAMENT_FORCE_RESUME(command)
+    gcode.run_script_from_command.assert_not_called()
+
+
+def test_weak_defaults_reuse_native_commands(monitor: FilamentForce, gcode: Mock) -> None:
+    monitor.actions.has_template = {}
+    monitor._default_fault_pause_action(Mock())
+    command = Mock()
+    command.get.return_value = "25"
+    monitor._default_fault_resume_action(command)
+    assert gcode.run_script_from_command.call_args_list == [call("PAUSE"), call("RESUME VELOCITY=25")]
