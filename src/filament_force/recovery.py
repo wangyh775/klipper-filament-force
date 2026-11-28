@@ -61,6 +61,7 @@ class Recovery:
     state: RecoveryState = RecoveryState.MONITORING
     attempts: int = 0
     healthy: int = 0
+    bad: int = 0
     deadline: float = 0.0
     before_z: float | None = None
     last_z: float | None = None
@@ -71,6 +72,7 @@ class Recovery:
         self.state = RecoveryState.PREPARING
         self.clearance = False
         self.healthy = 0
+        self.bad = 0
         self.failure = ""
 
     def fail(self, reason: str) -> None:
@@ -81,6 +83,7 @@ class Recovery:
     def start_verification(self, now: float, timeout: float) -> None:
         self.state = RecoveryState.VERIFYING
         self.healthy = 0
+        self.bad = 0
         self.deadline = now + timeout
         self.last_z = None
 
@@ -88,8 +91,10 @@ class Recovery:
         self.last_z = band.z_score
         if band.kind is AnomalyKind.NONE:
             self.healthy += 1
+            self.bad = 0
         else:
             self.healthy = 0
+            self.bad += 1
         if self.healthy >= needed:
             self.state = RecoveryState.MONITORING
             self.clearance = False
