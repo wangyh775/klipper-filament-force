@@ -10,8 +10,14 @@ class SampleHealth:
     last_mcu: float | None = None
     last_host: float | None = None
 
-    def note(self, timestamp: float, now: float) -> bool:
+    def note(self, timestamp: float, now: float, *,
+             estimated: float | None = None, max_age_s: float = 1.0) -> bool:
         if not isfinite(timestamp) or not isfinite(now):
+            return False
+        # Host monotonic is NOT the MCU print-time clock. The caller maps it
+        # with MCU.estimated_print_time before testing buffered sample age.
+        if estimated is not None and (not isfinite(estimated)
+                or not -0.1 <= estimated - timestamp <= max_age_s):
             return False
         if self.last_mcu is not None and timestamp <= self.last_mcu:
             return False

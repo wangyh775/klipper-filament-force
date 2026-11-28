@@ -313,6 +313,12 @@ class FilamentForce:
         self.baseline_max_span_g = config.getfloat("baseline_max_span_g", 100.0, above=0.0)
         self.baseline_timeout_s = config.getfloat("baseline_timeout_s", 3.0, above=0.0)
         self.sensor_timeout_s = config.getfloat("sensor_timeout_s", 2.0, above=0.0)
+        self.sample_max_age_s = config.getfloat("sample_max_age_s", 1.0, above=0.0)
+        self.window_max_sample_gap_s = config.getfloat("window_max_sample_gap_s", 0.05, above=0.0)
+        self.window_min_samples = config.getint("window_min_samples", 5, minval=2)
+        self._last_force_sample_time: float | None = None
+        self._window_quality = "unknown"
+        self._invalid_windows = 0
         self._sample_health = SampleHealth()
         self._baseline = StableBaseline()
         self._baseline_wait_since: float | None = None
@@ -570,6 +576,9 @@ class FilamentForce:
             "rolling_window": self.rolling_window,
             "baseline_time": self.baseline_time,
             "baseline_max_span_g": self.baseline_max_span_g,
+            "sample_max_age_s": self.sample_max_age_s,
+            "window_max_sample_gap_s": self.window_max_sample_gap_s,
+            "window_min_samples": self.window_min_samples,
             "idle_reset_s": self.idle_reset_s,
             "min_learn_s": self.min_learn_s,
             "poll_interval": self.poll_interval,
@@ -953,6 +962,9 @@ class FilamentForce:
         self._force_ref_locked = False
         self._baseline.reset()
         self._baseline_wait_since = None
+        self._last_force_sample_time = None
+        self._invalid_windows = 0
+        self._window_quality = "unknown"
         self._seen_forward_e = False
         self._idle_confirmed = False
         self._jam_above_since = None
@@ -1021,7 +1033,7 @@ class FilamentForce:
                 self._diag_generation += 1
                 self._incident_recoverable = False
                 # A sensor fault outside recovery starts its own incident.
-                if reason in ("load cell stream stale", "force baseline unavailable"):
+                if reason in ("load cell stream stale", "force baseline unavailable", "force window quality invalid"):
                     if self._recovery.state is RecoveryState.MONITORING:
                         self._incident_id = None
                         self._incident_filename = ""
@@ -1071,7 +1083,10 @@ class FilamentForce:
     def _force_client(self, msg: object) -> bool:
         now = self.reactor.monotonic()
         samples = force_signal.iter_load_cell_samples(msg)
-        fresh = [sample for sample in samples if self._sample_health.note(sample.timestamp, now)]
+        clock = self._estimated_print_time
+        estimated = clock(now) if clock is not None else None
+        fresh = [sample for sample in samples if self._sample_health.note(
+            sample.timestamp, now, estimated=estimated, max_age_s=self.sample_max_age_s)]
         capture = self._resume_capture
         if capture is not None:
             for sample in samples:
@@ -1093,6 +1108,10 @@ class FilamentForce:
         if self._triggering and not in_probe:
             return True
         for sample in fresh:
+            if (self._last_force_sample_time is not None
+                    and sample.timestamp - self._last_force_sample_time > self.window_max_sample_gap_s):
+                self._jam_above_since = None
+            self._last_force_sample_time = sample.timestamp
             self._last_force = sample.force
             if getattr(self, "event_enabled", False) and not in_probe and not self.actions.pending_recheck:
                 self._event_journal.note(sample)
@@ -1249,6 +1268,28 @@ class FilamentForce:
         raw_g = completed.level
         if not math.isfinite(raw_g) or not math.isfinite(completed.e_speed):
             return next_time
+        quality = completed.qualified(min_samples=self.window_min_samples,
+                                     max_gap_s=self.window_max_sample_gap_s,
+                                     edge_allowance_s=self.poll_interval + self.sample_max_age_s)
+        self._window_quality = "valid" if quality else "invalid"
+        if not quality:
+            self._invalid_windows += 1
+            self._book_for(self.active_tool).clear_streaks()
+            self._recovery.clear_evidence()
+            self._reset_stability()
+            key = self.active_tool if self.active_tool >= 0 else -1
+            for pending in self._restored_bins:
+                if pending[0] == key:
+                    self._restored_bins[pending] = 0
+            if self._invalid_windows >= self.confirm_windows and not self._protection_queued:
+                self._protection_queued = True
+                self._protection_queued_at = eventtime
+                self._protection_escalated = False
+                generation = self._diag_generation
+                self.reactor.register_callback(lambda _t: self._stop_unprotected(
+                    generation, "force window quality invalid"))
+            return next_time
+        self._invalid_windows = 0
         self._last_level_g = raw_g
         self._last_e_speed = completed.e_speed
         bin_i = force_signal.speed_bin_index(
@@ -1268,6 +1309,9 @@ class FilamentForce:
                 "host_monotonic_s": eventtime, "duration_s": completed.t_win,
                 "e_speed_mm_s": completed.e_speed, "force_g": raw_g,
                 "bin": bin_i, "short_bead": short_bead,
+                "sample_count": completed.sample_count,
+                "max_sample_gap_s": completed.max_sample_gap_s,
+                "sample_span_s": completed.sample_span_s, "quality_state": self._window_quality,
             })
         if self._recovery.state is RecoveryState.VERIFYING:
             if not short_bead:
@@ -2421,6 +2465,8 @@ class FilamentForce:
         return {
             "protection_fault": self._protection_fault,
             "sensor_last_sample_age_s": self._sample_health.age(self.reactor.monotonic()),
+            "window_quality": self._window_quality,
+            "invalid_windows": self._invalid_windows,
             "recovery_state": self._recovery.state.value,
             "recovery_attempts": self._recovery.attempts,
             "recovery_total_attempts": self._recovery_total,

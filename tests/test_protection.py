@@ -30,3 +30,12 @@ def test_watchdog_initial_grace() -> None:
     health = SampleHealth()
     assert not health.stale(1.99, 0.0, 2.0)
     assert health.stale(2.0, 0.0, 2.0)
+
+
+def test_buffered_stale_samples_cannot_refresh_health() -> None:
+    health = SampleHealth()
+    assert health.note(10.0, 100.0, estimated=10.2)
+    assert not health.note(11.0, 103.0, estimated=14.0)
+    assert not health.note(15.0, 103.0, estimated=14.0)
+    assert health.stale(103.0, 100.0, 2.0)
+    assert health.note(14.0, 103.0, estimated=14.1)
